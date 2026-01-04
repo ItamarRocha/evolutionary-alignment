@@ -1,0 +1,51 @@
+# TRL GRPO config for reproducing Table 2 (Conciseness)
+# Paper: "Evolution Strategies at Scale" – Conciseness setup
+# Base model: Qwen/Qwen2.5-7B-Instruct
+
+model_name: Qwen/Qwen2.5-7B-Instruct
+
+# Data (2 train, 8 eval; Appendix A.1 / Tables 4 & 5)
+train_jsonl: /n/holylabs/LABS/sham_lab/Users/jbejjani/evolutionary-alignment/conciseness/data/train.jsonl
+eval_jsonl: /n/holylabs/LABS/sham_lab/Users/jbejjani/evolutionary-alignment/conciseness/data/eval.jsonl
+prompt_key: question
+solution_key: answer
+
+# GRPO group size (Table 2)
+num_generations: 30
+
+# Lengths
+max_prompt_length: 128
+max_completion_length: 128
+
+# Decoding (sampling during training; ES is greedy but GRPO not specified — use plain defaults)
+temperature: 0.7
+top_p: 1.0
+
+# Optim (α = 5e-6, 1000 iterations)
+learning_rate: 5.0e-6
+lr_scheduler_type: constant
+warmup_steps: 0
+num_train_epochs: 1
+max_steps: 1000
+gradient_accumulation_steps: 15
+
+# Logging / output
+project: trl_grpo_concise
+entity: KURE-Spring-25
+output_dir: /n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/GRPO
+save_steps: 200
+logging_steps: 5
+
+# Sweep (Table 2 focuses on β)
+betas: [0.0, 0.01, 0.0167, 0.0464]
+seeds: [11, 22, 33, 44]
+
+# Plain GRPO (Table 2);
+loss_type: grpo
+
+# Evaluation and completion logging
+eval_steps: 50
+num_generations_eval: 4
+
+completion_log_steps: 50
+completion_log_num_prompts: 8

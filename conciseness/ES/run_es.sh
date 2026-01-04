@@ -1,0 +1,39 @@
+#!/bin/bash
+#SBATCH --job-name=es_conciseness
+#SBATCH --account=kempner_sham_lab
+#SBATCH --partition=kempner_h100
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=16
+#SBATCH --gpus-per-node=4
+#SBATCH --time=12:00:00
+#SBATCH --mem=256G
+#SBATCH --output=logs/es_conciseness_%A_%a.log
+#SBATCH --mail-user=jbejjani@college.harvard.edu
+#SBATCH --mail-type=ALL
+#SBATCH --array=0-3
+
+# Load modules
+module load python/3.12.11-fasrc02
+module load cuda/12.9.1-fasrc01
+module load cudnn/9.10.2.21_cuda12-fasrc01
+
+# Activate conda environment
+mamba deactivate
+source activate /n/holylabs/LABS/sham_lab/Users/jbejjani/envs/evolutionary-alignment
+
+accelerate launch \
+    --num_processes 4 \
+    --num_machines 1 \
+    --machine_rank 0 \
+    es_fine-tuning_conciseness_iid.py \
+    --model_name Qwen/Qwen2.5-7B-Instruct \
+    --gpu_threads 1 \
+    --max_new_tokens 128 \
+    --iterations 1000 \
+    --save_steps 500 \
+    --population_size 30 \
+    --sigma 0.001 \
+    --alpha 0.0005 \
+    --initial_seed $SLURM_ARRAY_TASK_ID \
+    --precision bf16
