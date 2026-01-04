@@ -13,7 +13,7 @@ pip install -r requirements.txt
 ## Credit
 
 Our data and Evolution Strategies train scripts for Conciseness and Countdown tasks are based on the following work:
-```
+```bibtex
 @misc{qiu2025evolutionstrategiesscalellm,
       title={Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning}, 
       author={Xin Qiu and Yulu Gan and Conor F. Hayes and Qiyao Liang and Elliot Meyerson and Babak Hodjat and Risto Miikkulainen},
