@@ -48,7 +48,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-3B-Instruct')
 parser.add_argument('--hf_cache_dir', type=str, default='hf_cache')
-parser.add_argument('--output_dir', type=str, default='/n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/checkpoints', help='Output directory for checkpoints and final model')
+parser.add_argument('--output_dir', type=str, default='/n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/ES', help='Output directory for checkpoints and final model')
 parser.add_argument('--precision', type=str, default='bf16')
 parser.add_argument('--gpu_threads', type=int, default=4, help='Number of parallel threads per GPU')
 parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
@@ -316,11 +316,11 @@ def evaluate_eval_set_distributed(model, tokenizer, eval_dataset, accelerator, v
     return mean, mn, mx, std, rewards
 
 
-def log_eval_completions_to_wandb(model, tokenizer, eval_dataset, accelerator, wandb_run, step, max_rows, max_chars, seed):
+def log_eval_completions(model, tokenizer, eval_dataset, accelerator, wandb_run, step, max_rows, max_chars, seed):
     """
-    Logs a small table of eval completions to wandb (main process only).
+    Logs eval completions to both stdout and wandb (main process only).
     """
-    if wandb_run is None or eval_dataset is None or len(eval_dataset) == 0:
+    if eval_dataset is None or len(eval_dataset) == 0:
         return
     if not accelerator.is_main_process:
         return
@@ -343,19 +343,32 @@ def log_eval_completions_to_wandb(model, tokenizer, eval_dataset, accelerator, w
         return_text=True
     )
 
-    table = wandb.Table(columns=["idx", "question", "target", "generated", "gen_len", "target_len", "reward"])
-    for i, q, t, g, r in zip(sample_indices, input_texts, target_texts, generated_texts, rewards):
-        table.add_data(
-            int(i),
-            _truncate(q, max_chars),
-            _truncate(t, max_chars),
-            _truncate(g, max_chars),
-            len(g),
-            len(t),
-            float(r),
-        )
+    # Print to stdout
+    print(f"\n[Eval Completions - Step {step}]")
+    print("-" * 80)
+    for i, (idx, q, t, g, r) in enumerate(zip(sample_indices, input_texts, target_texts, generated_texts, rewards)):
+        print(f"  [{i+1}/{k}] idx={idx}")
+        print(f"    Prompt: {_truncate(q, max_chars)}")
+        print(f"    Target: {_truncate(t, max_chars)} (len={len(t)})")
+        print(f"    Generated: {_truncate(g, max_chars)} (len={len(g)})")
+        print(f"    Reward: {r:.2f}")
+        print()
+    print("-" * 80)
 
-    wandb_run.log({"eval/completions": table}, step=step)
+    # Log to wandb
+    if wandb_run is not None:
+        # Create table with matching column names to GRPO's LogCompletionsCallback
+        table = wandb.Table(columns=["step", "prompt", "completion", "target", "reward"])
+        for idx, q, t, g, r in zip(sample_indices, input_texts, target_texts, generated_texts, rewards):
+            table.add_data(
+                int(step),
+                _truncate(q, max_chars),
+                _truncate(g, max_chars),
+                _truncate(t, max_chars),
+                float(r),
+            )
+        # Use same key pattern as TRL's LogCompletionsCallback
+        wandb_run.log({"completions": table}, step=step)
 
 
 def process_seed(seed_args):
@@ -459,14 +472,14 @@ def verify_setup(tokenizer, accelerator, args):
         else:
             print("  ⚠️  WARNING: Missing assistant generation prompt!")
     
-    # Training config summary
+    # Training config summary (matching GRPO format)
     print(f"\n[Training Config]")
     print(f"  algorithm: Evolution Strategies")
     print(f"  sigma (noise scale): {SIGMA}")
     print(f"  alpha (learning rate): {ALPHA}")
     print(f"  population_size: {POPULATION_SIZE}")
-    print(f"  iterations: {NUM_ITERATIONS}")
-    print(f"  max_new_tokens: {max_new_tokens}")
+    print(f"  max_steps: {NUM_ITERATIONS}")
+    print(f"  max_completion_length: {max_new_tokens}")
     print(f"  do_sample: {do_sample}")
     print(f"  seed: {initial_seed}")
     
@@ -541,7 +554,7 @@ def main():
     if accelerator.is_main_process and not args.no_wandb:
         run_name = args.wandb_run_name
         if run_name is None:
-            run_name = f"es_seed{args.initial_seed}_sigma{SIGMA}_alpha{ALPHA}_pop{POPULATION_SIZE}"
+            run_name = f"qwen2.5-7b_es_conciseness_alpha{ALPHA}_sigma{SIGMA}_seed{args.initial_seed}"
         
         wandb.init(
             project=args.wandb_project,
@@ -550,7 +563,7 @@ def main():
             config={
                 "algorithm": "evolution_strategies",
                 "model_name": args.model_name,
-                "initial_seed": args.initial_seed,
+                "seed": args.initial_seed,
                 "sigma": SIGMA,
                 "alpha": ALPHA,
                 "population_size": POPULATION_SIZE,
@@ -724,9 +737,40 @@ def main():
             torch.cuda.synchronize(accelerator.device)
 
         force_memory_cleanup()
-        
+
+        iter_time = time.time() - iter_start_time
+
+        mean_reward = float(rewards_tensor.mean())
+        min_reward = float(rewards_tensor.min())
+        max_reward = float(rewards_tensor.max())
+        std_reward = float(rewards_tensor.std())
+
+        # Compute decoded lengths for this iteration (approximate from rewards)
+        # Since reward = -|len(gen) - len(target)|, we can't recover exact lengths
+        # But we can log the reward stats which reflect length matching
+
+        if accelerator.is_main_process:
+            print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, "
+                  f"Mean: {mean_reward:.2f}, Min: {min_reward:.2f}, Max: {max_reward:.2f}, Std: {std_reward:.2f}")
+            print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated, "
+                  f"{torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak")
+
+            # Log to wandb with consistent metric names
+            if wandb_run is not None:
+                wandb_run.log({
+                    # Training metrics - use same names as GRPO where applicable
+                    "train/reward/mean": mean_reward,
+                    "train/reward/min": min_reward,
+                    "train/reward/max": max_reward,
+                    "train/reward/std": std_reward,
+                    # Time metrics
+                    "time/iteration": iter_time,
+                    # GPU metrics
+                    "gpu_memory/allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+                    "gpu_memory/peak_mb": torch.cuda.max_memory_allocated() / 1024**2,
+                }, step=iteration + 1)
+
         # --- Periodic Eval ---
-        eval_metrics = None
         if eval_dataset is not None and args.eval_steps > 0 and ((iteration + 1) % args.eval_steps == 0):
             eval_metrics = evaluate_eval_set_distributed(
                 original_model, tokenizer, eval_dataset, accelerator, verbose=args.verbose
@@ -740,50 +784,29 @@ def main():
                           f"Mean {eval_mean:.2f}  Min {eval_min:.2f}  Max {eval_max:.2f}  Std {eval_std:.2f}")
 
                     if wandb_run is not None:
+                        # Use consistent eval metric names
                         wandb_run.log({
                             "eval/reward/mean": eval_mean,
                             "eval/reward/min": eval_min,
                             "eval/reward/max": eval_max,
                             "eval/reward/std": eval_std,
-                            "eval/size": len(eval_dataset),
                         }, step=iteration + 1)
 
-                        log_eval_completions_to_wandb(
-                            original_model, tokenizer, eval_dataset, accelerator,
-                            wandb_run=wandb_run,
-                            step=iteration + 1,
-                            max_rows=int(args.eval_log_completions),
-                            max_chars=int(args.eval_log_max_chars),
-                            seed=int(initial_seed),
-                        )
-
-        iter_time = time.time() - iter_start_time
-
-        mean_reward = rewards_tensor.mean().item()
-        min_reward = rewards_tensor.min().item()
-        max_reward = rewards_tensor.max().item()
-        std_reward = rewards_tensor.std().item()
+                    # Log completions to both stdout and wandb
+                    log_eval_completions(
+                        original_model, tokenizer, eval_dataset, accelerator,
+                        wandb_run=wandb_run,
+                        step=iteration + 1,
+                        max_rows=int(args.eval_log_completions),
+                        max_chars=int(args.eval_log_max_chars),
+                        seed=int(initial_seed),
+                    )
 
         del rewards_tensor, rewards_normalized
         force_memory_cleanup()
 
+        # Save checkpoint
         if accelerator.is_main_process:
-            print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, Mean: {mean_reward:.2f}, Min: {min_reward:.2f}, Max: {max_reward:.2f}")
-            print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated, {torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak")
-
-            if wandb_run is not None:
-                wandb_run.log({
-                    "iteration": iteration + 1,
-                    "reward/mean": mean_reward,
-                    "reward/min": min_reward,
-                    "reward/max": max_reward,
-                    "reward/std": std_reward,
-                    "time/iteration": iter_time,
-                    "gpu_memory/allocated_mb": torch.cuda.memory_allocated() / 1024**2,
-                    "gpu_memory/peak_mb": torch.cuda.max_memory_allocated() / 1024**2,
-                }, step=iteration + 1)
-
-            # Save checkpoint every save_steps iterations
             if args.save_steps > 0 and (iteration + 1) % args.save_steps == 0:
                 save_model_checkpoint(
                     original_model, tokenizer, iteration + 1,

@@ -32,9 +32,9 @@ max_steps: 1000
 gradient_accumulation_steps: 15
 
 # Logging / output
-project: trl_grpo_concise_fix
+project: conciseness
 entity: KURE-Spring-25
-output_dir: /n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/GRPO/fix
+output_dir: /n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/GRPO
 save_steps: 500
 logging_steps: 5
 

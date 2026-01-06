@@ -11,7 +11,7 @@
 #SBATCH --output=logs/es_conciseness_%A_%a.log
 #SBATCH --mail-user=jbejjani@college.harvard.edu
 #SBATCH --mail-type=ALL
-#SBATCH --array=0-3
+#SBATCH --array=0
 
 # Load modules
 module load python/3.12.11-fasrc02
@@ -29,6 +29,9 @@ accelerate launch \
     es_fine-tuning_conciseness_iid.py \
     --model_name Qwen/Qwen2.5-7B-Instruct \
     --hf_cache_dir /n/netscratch/sham_lab/Everyone/jbejjani/hf_cache \
+    --output_dir /n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/ES \
+    --wandb_project conciseness \
+    --wandb_entity KURE-SPRING-25 \
     --gpu_threads 1 \
     --max_new_tokens 128 \
     --iterations 1000 \

@@ -113,7 +113,7 @@ def make_reward_func_from_map(cfg: dict, tokenizer):
             rewards.append(float(r))
             decoded_len.append(len(y))
 
-        # W&B logging on rank 0
+        # W&B logging on rank 0 - use consistent metric names with ES
         try:
             import wandb
             if os.environ.get("RANK", "0") == "0" and len(rewards) > 0:
@@ -121,7 +121,10 @@ def make_reward_func_from_map(cfg: dict, tokenizer):
                     "train/decoded_length/mean": sum(decoded_len) / len(decoded_len),
                     "train/decoded_length/min": min(decoded_len),
                     "train/decoded_length/max": max(decoded_len),
-                    "train/reward_raw/mean": sum(rewards) / len(rewards),
+                    "train/reward/mean": sum(rewards) / len(rewards),
+                    "train/reward/min": min(rewards),
+                    "train/reward/max": max(rewards),
+                    "train/reward/std": float(__import__('numpy').std(rewards)) if len(rewards) > 1 else 0.0,
                 }, commit=False)
         except Exception:
             pass
@@ -166,14 +169,80 @@ def verify_setup(tokenizer, train_ds, cfg, args):
     
     # Config summary
     print(f"\n[Training Config]")
+    print(f"  algorithm: GRPO")
     print(f"  beta (KL coef): {args.beta}")
-    print(f"  num_generations: {cfg['num_generations']}")
-    print(f"  max_completion_length: {cfg['max_completion_length']}")
     print(f"  learning_rate: {cfg['learning_rate']}")
+    print(f"  num_generations: {cfg['num_generations']}")
     print(f"  max_steps: {cfg.get('max_steps', 1000)}")
+    print(f"  max_completion_length: {cfg['max_completion_length']}")
     print(f"  seed: {args.seed}")
     
     print("\n" + "=" * 60 + "\n")
+
+
+class LogCompletionsToStdoutCallback:
+    """
+    Callback to print completions to stdout when LogCompletionsCallback logs to wandb.
+    This hooks into the trainer's evaluation to print samples.
+    """
+    def __init__(self, trainer, tokenizer, eval_dataset, num_prompts=8, freq=50, max_chars=500):
+        self.trainer = trainer
+        self.tokenizer = tokenizer
+        self.eval_dataset = eval_dataset
+        self.num_prompts = num_prompts
+        self.freq = freq
+        self.max_chars = max_chars
+        self.last_logged_step = -1
+        
+    def _truncate(self, s, n):
+        if s is None:
+            return ""
+        s = str(s)
+        return s if len(s) <= n else (s[:n] + "…")
+    
+    def maybe_log(self, step):
+        """Call this periodically to check if we should log."""
+        if step <= self.last_logged_step:
+            return
+        if step % self.freq != 0:
+            return
+        if self.eval_dataset is None or len(self.eval_dataset) == 0:
+            return
+            
+        self.last_logged_step = step
+        
+        import numpy as np
+        
+        n = len(self.eval_dataset)
+        k = min(self.num_prompts, n)
+        
+        rng = np.random.RandomState(step)
+        indices = rng.choice(n, size=k, replace=False).tolist()
+        
+        print(f"\n[Eval Completions - Step {step}]")
+        print("-" * 80)
+        
+        for i, idx in enumerate(indices):
+            sample = self.eval_dataset[idx]
+            prompt = sample.get('prompt', '')
+            answer = sample.get('answer', '')
+            
+            # Extract just the user question from the formatted prompt for display
+            # The prompt is formatted with chat template, extract the content
+            display_prompt = prompt
+            if '<|im_start|>user\n' in prompt:
+                start = prompt.find('<|im_start|>user\n') + len('<|im_start|>user\n')
+                end = prompt.find('<|im_end|>', start)
+                if end > start:
+                    display_prompt = prompt[start:end]
+            
+            print(f"  [{i+1}/{k}] idx={idx}")
+            print(f"    Prompt: {self._truncate(display_prompt, self.max_chars)}")
+            print(f"    Target: {self._truncate(answer, self.max_chars)} (len={len(answer)})")
+            print(f"    (Completion logged to wandb)")
+            print()
+        
+        print("-" * 80)
 
 
 def main():
@@ -291,7 +360,6 @@ def main():
             if hasattr(trainer, 'ref_model') and trainer.ref_model is not None:
                 print(f"  ✓ Reference model loaded (beta={args.beta})")
             else:
-                # In some TRL versions, ref_model might be created lazily or named differently
                 print(f"    Reference model attribute not found directly.")
                 print(f"    This may be normal - TRL 0.26.2 handles ref model internally.")
                 print(f"    Monitor 'kl' in training logs to verify KL is computed.")
@@ -299,6 +367,7 @@ def main():
             print(f"    beta=0.0, KL regularization disabled")
 
     # Completion logging callback
+    stdout_logger = None
     if eval_ds is not None and len(eval_ds) > 0:
         from trl import LogCompletionsCallback
         from transformers import GenerationConfig
@@ -323,9 +392,34 @@ def main():
                 freq=completion_log_steps,
             )
         )
+        
+        # Create stdout logger for completions
+        stdout_logger = LogCompletionsToStdoutCallback(
+            trainer=trainer,
+            tokenizer=tokenizer,
+            eval_dataset=eval_ds,
+            num_prompts=completion_log_num_prompts,
+            freq=completion_log_steps,
+            max_chars=500,
+        )
+        
         if os.environ.get("RANK", "0") == "0":
             print(f"[Callbacks]")
             print(f"  ✓ LogCompletionsCallback added (every {completion_log_steps} steps, {completion_log_num_prompts} prompts)")
+
+    # Custom callback to log completions to stdout
+    from transformers import TrainerCallback
+    
+    class StdoutCompletionLoggerCallback(TrainerCallback):
+        def __init__(self, stdout_logger):
+            self.stdout_logger = stdout_logger
+            
+        def on_step_end(self, args, state, control, **kwargs):
+            if self.stdout_logger is not None and os.environ.get("RANK", "0") == "0":
+                self.stdout_logger.maybe_log(state.global_step)
+    
+    if stdout_logger is not None:
+        trainer.add_callback(StdoutCompletionLoggerCallback(stdout_logger))
 
     # Train
     if os.environ.get("RANK", "0") == "0":
