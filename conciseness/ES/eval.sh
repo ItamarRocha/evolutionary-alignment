@@ -30,16 +30,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 sigma=0.001
 alpha=0.0005
 
-python conciseness_eval_es_seeds_sweep.py \
-        --baseline_model_name Qwen/Qwen2.5-7B-Instruct \
-        --hf_cache_dir /n/netscratch/sham_lab/Everyone/jbejjani/hf_cache \
-        --precision bf16 \
-        --max_new_tokens 128 \
-        --num_samples 20 \
-        --eval_data_path data/eval.jsonl \
-        --print-examples \
-        --output_json ES/evals/alpha${alpha}_sigma${sigma}.json \
-        --seed 42 \
-        --sigma ${sigma} \
-        --alpha ${alpha} \
-        --do_sample
+python conciseness_eval.py \
+    --algorithm es \
+    --sigma ${sigma} \
+    --alpha ${alpha} \
+    --baseline_model_name Qwen/Qwen2.5-7B-Instruct \
+    --hf_cache_dir /n/netscratch/sham_lab/Everyone/jbejjani/hf_cache \
+    --precision bf16 \
+    --max_new_tokens 128 \
+    --do_sample \
+    --seeds 0,1,2,3 \
+    --num_samples 20 \
+    --print_examples \
+    --output_json ES/evals/alpha${alpha}_sigma${sigma}.json \
+    --eval_seed 44

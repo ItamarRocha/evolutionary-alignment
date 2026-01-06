@@ -28,18 +28,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 for beta in 0.1 0.0464 0.0
 do
-    python conciseness_eval_grpo_seeds_sweep.py \
+    python conciseness_eval.py \
+        --algorithm grpo \
+        --beta ${beta} \
         --baseline_model_name Qwen/Qwen2.5-7B-Instruct \
         --hf_cache_dir /n/netscratch/sham_lab/Everyone/jbejjani/hf_cache \
         --precision bf16 \
         --max_new_tokens 128 \
+        --do_sample \
+        --seeds 0,1,2,3 \
         --num_samples 20 \
-        --eval_data_path /n/holylabs/LABS/sham_lab/Users/jbejjani/evolutionary-alignment/conciseness/data/eval.jsonl \
-        --print-examples \
+        --print_examples \
         --output_json GRPO/evals/temp_0.7_beta${beta}.json \
-        --seed 42 \
-        --beta ${beta} \
-        --temperature 1.0 \
-        --top_p 1.0 \
-        --do_sample
+        --eval_seed 44
 done
