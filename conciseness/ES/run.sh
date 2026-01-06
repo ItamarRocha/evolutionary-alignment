@@ -28,6 +28,7 @@ accelerate launch \
     --machine_rank 0 \
     es_fine-tuning_conciseness_iid.py \
     --model_name Qwen/Qwen2.5-7B-Instruct \
+    --hf_cache_dir /n/netscratch/sham_lab/Everyone/jbejjani/hf_cache \
     --gpu_threads 1 \
     --max_new_tokens 128 \
     --iterations 1000 \
