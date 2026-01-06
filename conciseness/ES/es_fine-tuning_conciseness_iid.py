@@ -63,6 +63,15 @@ parser.add_argument('--wandb_project', type=str, default='es-fine-tuning-concise
 parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (default: auto-generated)')
 parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity name')
 parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
+parser.add_argument('--eval_jsonl', type=str, default='../data/eval.jsonl',
+                    help='Path to eval JSONL with {"question","answer"} lines (default: ../data/eval.jsonl).')
+parser.add_argument('--eval_steps', type=int, default=50,
+                    help='Evaluate every N iterations. Set <=0 to disable. (default: 50)')
+parser.add_argument('--eval_log_completions', type=int, default=8,
+                    help='How many eval completions to log to W&B each eval. (default: 8)')
+parser.add_argument('--eval_log_max_chars', type=int, default=500,
+                    help='Truncate logged question/target/generated strings to this many chars. (default: 500)')
+
 args = parser.parse_args()
 
 
@@ -79,11 +88,30 @@ initial_seed = args.initial_seed             # Initial random seed
 # --- Load Dataset from JSONL File ---
 # Load training data from conciseness/data/train.jsonl
 dataset = []
-with open('conciseness/data/train.jsonl', 'r') as f:
+with open('../data/train.jsonl', 'r') as f:
     for line in f:
         if line.strip():  # Skip empty lines
             data = json.loads(line)
             dataset.append((data['question'], data['answer']))
+            
+# --- Load Eval Dataset from JSONL File ---
+eval_dataset = []
+_eval_path = args.eval_jsonl
+
+def _load_jsonl_pairs(path):
+    pairs = []
+    with open(path, 'r') as f:
+        for line in f:
+            if line.strip():
+                d = json.loads(line)
+                pairs.append((d["question"], d["answer"]))
+    return pairs
+
+if os.path.exists(_eval_path):
+    eval_dataset = _load_jsonl_pairs(_eval_path)
+else:
+    eval_dataset = None  # disables eval cleanly
+
 
 def compute_reward(generated_text, target_text):
     # Negative absolute difference in length
@@ -162,6 +190,101 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
         return rewards, generated_texts
     else:
         return rewards
+
+def _truncate(s: str, n: int) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    return s if len(s) <= n else (s[:n] + "…")
+
+def evaluate_eval_set_distributed(model, tokenizer, eval_dataset, accelerator, verbose=False):
+    """
+    Evaluate current (unperturbed) model on eval_dataset across processes.
+    Returns (mean, min, max, std, rewards_list).
+    """
+    if eval_dataset is None or len(eval_dataset) == 0:
+        return None
+
+    n = len(eval_dataset)
+    device = accelerator.device
+
+    # Assign eval examples by index to processes (like your seed assignment)
+    local_indices = [i for i in range(n) if (i % accelerator.num_processes) == accelerator.process_index]
+    local_inputs = [eval_dataset[i][0] for i in local_indices]
+    local_targets = [eval_dataset[i][1] for i in local_indices]
+
+    if verbose:
+        print(f"[Eval] process {accelerator.process_index} evaluating {len(local_indices)}/{n} examples")
+
+    # Compute local rewards (batched) using your existing evaluate_model
+    local_rewards = []
+    if len(local_inputs) > 0:
+        local_rewards = evaluate_model(
+            model, tokenizer,
+            local_inputs, local_targets,
+            accelerator,
+            seed_idx=None, thread_id=None,
+            verbose=False,
+            return_text=False
+        )
+
+    # Build a full rewards tensor and reduce across processes (each index is filled by exactly one process)
+    rewards_tensor = torch.zeros(n, device=device, dtype=torch.float32)
+    for idx, r in zip(local_indices, local_rewards):
+        rewards_tensor[idx] = float(r)
+
+    if accelerator.num_processes > 1:
+        torch.distributed.all_reduce(rewards_tensor, op=torch.distributed.ReduceOp.SUM)
+
+    rewards = rewards_tensor.detach().cpu().numpy()
+    mean = float(rewards.mean())
+    mn = float(rewards.min())
+    mx = float(rewards.max())
+    std = float(rewards.std())
+
+    del rewards_tensor
+    force_memory_cleanup()
+
+    return mean, mn, mx, std, rewards
+
+def log_eval_completions_to_wandb(model, tokenizer, eval_dataset, accelerator, wandb_run, step, max_rows, max_chars, seed):
+    """
+    Logs a small table of eval completions to wandb (main process only).
+    """
+    if wandb_run is None or eval_dataset is None or len(eval_dataset) == 0:
+        return
+    if not accelerator.is_main_process:
+        return
+
+    n = len(eval_dataset)
+    k = max(1, min(max_rows, n))
+
+    rng = np.random.RandomState(int(seed) + int(step))
+    sample_indices = rng.choice(n, size=k, replace=False).tolist()
+
+    input_texts = [eval_dataset[i][0] for i in sample_indices]
+    target_texts = [eval_dataset[i][1] for i in sample_indices]
+
+    rewards, generated_texts = evaluate_model(
+        model, tokenizer,
+        input_texts, target_texts,
+        accelerator,
+        seed_idx=None, thread_id=None,
+        verbose=False,
+        return_text=True
+    )
+
+    table = wandb.Table(columns=["idx", "question", "target", "generated", "reward"])
+    for i, q, t, g, r in zip(sample_indices, input_texts, target_texts, generated_texts, rewards):
+        table.add_data(
+            int(i),
+            _truncate(q, max_chars),
+            _truncate(t, max_chars),
+            _truncate(g, max_chars),
+            float(r),
+        )
+
+    wandb_run.log({"eval/completions": table}, step=step)
 
 def process_seed(seed_args):
     """Function to process a single seed, used for thread pool"""
@@ -265,6 +388,10 @@ def main():
         print(f"Total processes: {accelerator.num_processes}, GPU threads per process: {args.gpu_threads}")
         print(f"Population size: {POPULATION_SIZE}, Iterations: {NUM_ITERATIONS}")
         print(f"Sigma: {SIGMA}, Alpha: {ALPHA}")
+        if eval_dataset is None:
+            print(f"[Eval] Disabled: eval file not found at '{args.eval_jsonl}' (and no fallback 'eval.jsonl').")
+        else:
+            print(f"[Eval] Loaded {len(eval_dataset)} eval examples from '{_eval_path}'. Eval every {args.eval_steps} steps.")
 
     # Load model
     model_name = args.model_name
@@ -419,6 +546,40 @@ def main():
             torch.cuda.synchronize(accelerator.device)
 
         force_memory_cleanup()
+        
+        # --- Periodic Eval ---
+        eval_metrics = None
+        if eval_dataset is not None and args.eval_steps > 0 and ((iteration + 1) % args.eval_steps == 0):
+            eval_metrics = evaluate_eval_set_distributed(
+                original_model, tokenizer, eval_dataset, accelerator, verbose=args.verbose
+            )
+
+            if eval_metrics is not None:
+                eval_mean, eval_min, eval_max, eval_std, _ = eval_metrics
+
+                if accelerator.is_main_process:
+                    print(f"[Eval] Iteration {iteration + 1}: "
+                          f"Mean {eval_mean:.2f}  Min {eval_min:.2f}  Max {eval_max:.2f}  Std {eval_std:.2f}")
+
+                    if wandb_run is not None:
+                        wandb_run.log({
+                            "eval/reward/mean": eval_mean,
+                            "eval/reward/min": eval_min,
+                            "eval/reward/max": eval_max,
+                            "eval/reward/std": eval_std,
+                            "eval/size": len(eval_dataset),
+                            "eval/path": _eval_path,
+                        }, step=iteration + 1)
+
+                        # Log a few completions for sanity checking
+                        log_eval_completions_to_wandb(
+                            original_model, tokenizer, eval_dataset, accelerator,
+                            wandb_run=wandb_run,
+                            step=iteration + 1,
+                            max_rows=int(args.eval_log_completions),
+                            max_chars=int(args.eval_log_max_chars),
+                            seed=int(initial_seed),
+                        )
 
         iter_time = time.time() - iter_start_time
 
@@ -448,8 +609,8 @@ def main():
                 }, step=iteration + 1)
 
             # Save checkpoint every save_steps iterations
-            # if (iteration + 1) % args.save_steps == 0:
-            #     save_model_checkpoint(original_model, tokenizer, iteration + 1, model_name, initial_seed, args, len(dataset), wandb_run)
+            if (iteration + 1) % args.save_steps == 0:
+                save_model_checkpoint(original_model, tokenizer, iteration + 1, model_name, initial_seed, args, len(dataset), wandb_run)
 
     total_time = time.time() - training_start_time
 

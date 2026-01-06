@@ -20,7 +20,7 @@ module load cudnn/9.10.2.21_cuda12-fasrc01
 
 # Activate conda environment
 mamba deactivate
-source activate /n/holylabs/LABS/sham_lab/Users/jbejjani/envs/evolutionary-alignment
+mamba activate /n/holylabs/LABS/sham_lab/Users/jbejjani/envs/evolutionary-alignment
 
 accelerate launch \
     --num_processes 4 \
