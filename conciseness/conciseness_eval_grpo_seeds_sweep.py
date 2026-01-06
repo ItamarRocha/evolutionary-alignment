@@ -24,6 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import logging
 import argparse
 from datetime import datetime
+import statistics
 
 
 logging.set_verbosity_error()
@@ -43,7 +44,7 @@ parser.add_argument('--do_sample', action='store_true', default=True,
                     help='Enable sampling vs greedy decoding')
 parser.add_argument('--num_samples', type=int, default=20,
                     help='Number of responses to generate per prompt')
-parser.add_argument('--eval_data_path', type=str, default='conciseness/data/eval.jsonl',
+parser.add_argument('--eval_data_path', type=str, default='/n/holylabs/LABS/sham_lab/Users/jbejjani/evolutionary-alignment/conciseness/data/eval.jsonl',
                     help='Path to evaluation data file')
 parser.add_argument('--print-examples', action='store_true', default=False,
                     help='Print one example generation per test sample with its reward')
@@ -52,15 +53,11 @@ parser.add_argument('--output_json', type=str, default=None,
 parser.add_argument('--seed', type=int, default=None,
                     help='Seed for random number generator')
 parser.add_argument('--beta', type=float, default=None,
-                    help='Beta for GRPO (stored for bookkeeping)')
+                    help='Beta for GRPO')
 parser.add_argument('--temperature', type=float, default=0.7,
                     help='Temperature for sampling')
 parser.add_argument('--top_p', type=float, default=1.0,
                     help='Top-p for sampling')
-parser.add_argument('--sigma', type=float, required=True,
-                    help='Sigma parameter for ES fine-tuning')
-parser.add_argument('--alpha', type=float, required=True,
-                    help='Alpha parameter for ES fine-tuning')
 args = parser.parse_args()
 
 
@@ -238,8 +235,7 @@ def main():
     print("=" * 80)
     print("Conciseness Reward Evaluation")
     print("=" * 80)
-    print(f"Sigma: {args.sigma}")
-    print(f"Alpha: {args.alpha}")
+    print(f"Beta: {args.beta}")
     print(f"Baseline model: {args.baseline_model_name}")
     print(f"Eval data path: {args.eval_data_path}")
     print(f"Precision: {args.precision}")
@@ -313,11 +309,12 @@ def main():
     print(f"Loaded {len(dataset)} evaluation samples")
 
     # Evaluate all 4 seeds
-    seeds = [0, 1, 2, 3]
+    seeds = [11, 22]
     seed_results = {}
 
     for seed in seeds:
-        model_path = f"/n/netscratch/sham_lab/Everyone/jbejjani/es-ft-experiments/checkpoints/conciseness/Qwen/Qwen2.5-7B-Instruct/{seed}/es_random_seed{seed}_pop30_iter1000_sigma{args.sigma}_alpha{args.alpha}_bf16_threads1_question_num2_final"
+        # model_path = f"/n/netscratch/kempner_sham_lab/Everyone/itamarf/es-fine-tuning-paper/GRPO_temp_0.7/beta{args.beta}_seed{seed}"
+        model_path = f"/n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/GRPO/v2/beta{args.beta}_seed{seed}"
 
         try:
             seed_result = evaluate_single_model(model_path, model_ref, tokenizer, dataset, device, dtype)
@@ -369,6 +366,23 @@ def main():
         aggregate_mean = float('nan')
         aggregate_std = float('nan')
 
+    # Collect mean per-token KL values from successful evaluations
+    kl_means = []
+    for seed, result in seed_results.items():
+        if "error" not in result and not np.isnan(result["kl"]["mean_per_token"]):
+            kl_means.append(result["kl"]["mean_per_token"])
+
+    if kl_means:
+        aggregate_kl_mean = statistics.mean(kl_means)
+        aggregate_kl_std = statistics.stdev(kl_means)
+
+        print(f"Aggregate KL mean: {aggregate_kl_mean:.6f}")
+        print(f"Aggregate KL std: {aggregate_kl_std:.6f}")
+    else:
+        print("No successful KL evaluations to aggregate")
+        aggregate_kl_mean = float('nan')
+        aggregate_kl_std = float('nan')
+
     # Print examples if requested (from first successful seed)
     if args.print_examples:
         for seed, result in seed_results.items():
@@ -388,8 +402,7 @@ def main():
     # Prepare results payload
     results = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "sigma": args.sigma,
-        "alpha": args.alpha,
+        "beta": args.beta,
         "baseline_model_name": args.baseline_model_name,
         "eval_data_path": data_path,
         "precision": args.precision,
@@ -404,6 +417,8 @@ def main():
         "aggregate": {
             "normalized_reward_mean": aggregate_mean,
             "normalized_reward_std": aggregate_std,
+            "mean_kl": aggregate_kl_mean,
+            "std_kl": aggregate_kl_std,
             "successful_seeds": len(normalized_means),
         },
         "slurm": {
@@ -413,7 +428,7 @@ def main():
     }
 
     # Decide output path and persist
-    default_output = os.path.join(os.path.dirname(__file__), '..', 'logs', f'conciseness_reward_results_sigma{args.sigma}_alpha{args.alpha}.json')
+    default_output = os.path.join(os.path.dirname(__file__), '..', 'logs', f'conciseness_eval_grpo_beta{args.beta}.json')
     output_path = args.output_json if args.output_json else default_output
     os.makedirs(os.path.abspath(os.path.join(output_path, os.pardir)), exist_ok=True)
     try:
