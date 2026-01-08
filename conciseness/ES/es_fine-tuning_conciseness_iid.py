@@ -137,9 +137,14 @@ def clean_completion(text: str) -> str:
     im_end_token = "<|im_end|>"
     eos_token = _tokenizer.eos_token or ""
     
-    for token in [im_end_token, eos_token]:
-        if token and text.endswith(token):
-            text = text[:-len(token)].strip()
+    # Strip repeatedly until no more special tokens
+    changed = True
+    while changed:
+        changed = False
+        for token in [im_end_token, eos_token]:
+            if token and text.endswith(token):
+                text = text[:-len(token)].strip()
+                changed = True
     return text
 
 
