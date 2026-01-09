@@ -18,7 +18,7 @@ Args:
     --sigma: Perturbation noise scale (default: 0.001)
     --alpha: Learning rate (default: 0.0005)
     --gpu_threads: Threads per GPU (default: 4)
-    --max_new_tokens: Max generation length (default: 100)
+    --max_new_tokens: Max generation length (default: 128)
     --wandb_project: W&B project name
 
 Output: Checkpoints and final model saved to specified output_dir
@@ -59,7 +59,7 @@ parser.add_argument('--sigma', type=float, default=0.001, help='Standard deviati
 parser.add_argument('--alpha', type=float, default=0.0005, help='Learning rate')
 parser.add_argument('--initial_seed', type=int, default=33, help='Initial random seed')
 parser.add_argument('--do_sample', default=False, action='store_true', help='Whether sampling is allowed in generating tokens, default to be not allowed (greedy decoding for ES)')
-parser.add_argument('--max_new_tokens', type=int, default=100, help='Maximum number of tokens allowed to be generated')
+parser.add_argument('--max_new_tokens', type=int, default=128, help='Maximum number of tokens allowed to be generated')
 parser.add_argument('--wandb_project', type=str, default='es-fine-tuning-conciseness', help='W&B project name')
 parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (default: auto-generated)')
 parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity name')
@@ -69,7 +69,7 @@ parser.add_argument('--eval_jsonl', type=str, default='../data/eval.jsonl',
 parser.add_argument('--eval_steps', type=int, default=50,
                     help='Evaluate every N iterations. Set <=0 to disable. (default: 50)')
 parser.add_argument('--eval_log_completions', type=int, default=8,
-                    help='How many eval completions to log to W&B each eval. (default: 8)')
+                    help='How many eval completions to log to stdout each eval. (default: 8)')
 parser.add_argument('--eval_log_max_chars', type=int, default=500,
                     help='Truncate logged question/target/generated strings to this many chars. (default: 500)')
 
@@ -116,6 +116,36 @@ else:
 # Global tokenizer reference (set in main, used for chat template)
 _tokenizer = None
 
+# Global EOS token IDs (set in main, includes both <|im_end|> and <|endoftext|>)
+_eos_token_ids = None
+
+
+def get_eos_token_ids(tokenizer):
+    """
+    Get all EOS token IDs for proper generation stopping.
+    For Qwen2.5-Instruct, this includes both <|im_end|> (chat end) and <|endoftext|> (model EOS).
+    """
+    eos_ids = set()
+    
+    # Add the standard EOS token
+    if tokenizer.eos_token_id is not None:
+        eos_ids.add(tokenizer.eos_token_id)
+    
+    # Add <|im_end|> token (Qwen chat format end token)
+    im_end_tokens = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    if len(im_end_tokens) == 1:
+        eos_ids.add(im_end_tokens[0])
+    
+    # Add <|endoftext|> explicitly if different from eos_token
+    try:
+        endoftext_tokens = tokenizer.encode("<|endoftext|>", add_special_tokens=False)
+        if len(endoftext_tokens) == 1:
+            eos_ids.add(endoftext_tokens[0])
+    except Exception:
+        pass
+    
+    return list(eos_ids)
+
 
 def format_prompt_with_chat_template(question: str) -> str:
     """Apply chat template to raw question for Qwen2.5-Instruct."""
@@ -129,31 +159,12 @@ def format_prompt_with_chat_template(question: str) -> str:
     return formatted
 
 
-def clean_completion(text: str) -> str:
-    """Remove EOS/chat-end tokens and strip whitespace."""
-    global _tokenizer
-    text = text.strip()
-    # Qwen2.5 uses <|im_end|> as the chat end token
-    im_end_token = "<|im_end|>"
-    eos_token = _tokenizer.eos_token or ""
-    
-    # Strip repeatedly until no more special tokens
-    changed = True
-    while changed:
-        changed = False
-        for token in [im_end_token, eos_token]:
-            if token and text.endswith(token):
-                text = text[:-len(token)].strip()
-                changed = True
-    return text
-
-
 def compute_reward(generated_text: str, target_text: str) -> float:
     """
     Reward: negative absolute difference in character length.
     generated_text should be the completion only (after cleaning).
     """
-    gen_clean = clean_completion(generated_text)
+    gen_clean = generated_text.strip()
     target_clean = target_text.strip()
     return -abs(len(gen_clean) - len(target_clean))
 
@@ -229,26 +240,21 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
             max_new_tokens=max_new_tokens, 
             do_sample=do_sample,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=_eos_token_ids,  # List of all EOS tokens including <|im_end|>
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize(accelerator.device)
 
     # Decode completion only (strip the prompt)
+    # FIX: Use skip_special_tokens=True to automatically remove <|im_end|>, <|endoftext|>, and padding
     generated_texts = []
     for i in range(len(input_texts_formatted)):
         # Get only the new tokens (completion)
         completion_ids = outputs[i][prompt_length:]
         
-        try:
-            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=False)
-        except TypeError:
-            tokens = tokenizer.convert_ids_to_tokens(completion_ids)
-            filtered = [t for t in tokens if t is not None]
-            completion_text = tokenizer.convert_tokens_to_string(filtered)
-        
-        # Clean the completion (remove <|im_end|>, EOS, etc.)
-        completion_text = clean_completion(completion_text)
+        # Decode with skip_special_tokens=True to remove all special tokens including padding
+        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+        completion_text = completion_text.strip()
         generated_texts.append(completion_text)
 
     del input_ids, outputs
@@ -321,23 +327,21 @@ def evaluate_eval_set_distributed(model, tokenizer, eval_dataset, accelerator, v
     return mean, mn, mx, std, rewards
 
 
-def log_eval_completions(model, tokenizer, eval_dataset, accelerator, wandb_run, step, max_rows, max_chars, seed):
+def log_completions_to_stdout(model, tokenizer, data, accelerator, step, max_chars, dataset_name):
     """
-    Logs eval completions to both stdout and wandb (main process only).
+    Logs completions to stdout only (no wandb tables).
+    Works for both eval and train datasets.
+    Main process only.
     """
-    if eval_dataset is None or len(eval_dataset) == 0:
+    if data is None or len(data) == 0:
         return
     if not accelerator.is_main_process:
         return
 
-    n = len(eval_dataset)
-    k = max(1, min(max_rows, n))
+    n = len(data)
 
-    rng = np.random.RandomState(int(seed) + int(step))
-    sample_indices = rng.choice(n, size=k, replace=False).tolist()
-
-    input_texts = [eval_dataset[i][0] for i in sample_indices]
-    target_texts = [eval_dataset[i][1] for i in sample_indices]
+    input_texts = [data[i][0] for i in range(n)]
+    target_texts = [data[i][1] for i in range(n)]
 
     rewards, generated_texts = evaluate_model(
         model, tokenizer,
@@ -349,31 +353,17 @@ def log_eval_completions(model, tokenizer, eval_dataset, accelerator, wandb_run,
     )
 
     # Print to stdout
-    print(f"\n[Eval Completions - Step {step}]")
+    print(f"\n[{dataset_name} Completions - Step {step}] ({n} samples)")
     print("-" * 80)
-    for i, (idx, q, t, g, r) in enumerate(zip(sample_indices, input_texts, target_texts, generated_texts, rewards)):
-        print(f"  [{i+1}/{k}] idx={idx}")
+    for idx in range(n):
+        q, t, g, r = input_texts[idx], target_texts[idx], generated_texts[idx], rewards[idx]
+        print(f"  [{idx+1}/{n}] idx={idx}")
         print(f"    Prompt: {_truncate(q, max_chars)}")
         print(f"    Target: {_truncate(t, max_chars)} (len={len(t)})")
         print(f"    Generated: {_truncate(g, max_chars)} (len={len(g)})")
         print(f"    Reward: {r:.2f}")
         print()
     print("-" * 80)
-
-    # Log to wandb
-    if wandb_run is not None:
-        # Create table with matching column names to GRPO's LogCompletionsCallback
-        table = wandb.Table(columns=["step", "prompt", "completion", "target", "reward"])
-        for idx, q, t, g, r in zip(sample_indices, input_texts, target_texts, generated_texts, rewards):
-            table.add_data(
-                int(step),
-                _truncate(q, max_chars),
-                _truncate(g, max_chars),
-                _truncate(t, max_chars),
-                float(r),
-            )
-        # Use same key pattern as TRL's LogCompletionsCallback
-        wandb_run.log({"completions": table}, step=step)
 
 
 def process_seed(seed_args):
@@ -455,6 +445,12 @@ def verify_setup(tokenizer, accelerator, args):
     # Check for Qwen chat tokens
     im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)
     print(f"  <|im_end|> token ids: {im_end_id}")
+    
+    # Show all EOS token IDs that will be used for generation stopping
+    eos_ids = get_eos_token_ids(tokenizer)
+    print(f"  eos_token_ids for generation: {eos_ids}")
+    if len(eos_ids) > 1:
+        print(f"  ✓ Multiple EOS tokens configured (generation will stop on <|im_end|>)")
     
     # Sample prompt check
     if len(dataset) > 0:
@@ -545,6 +541,12 @@ def verify_completion_extraction(model, tokenizer, accelerator):
     else:
         print("  ✓ No chat template artifacts in completion")
     
+    # Check if completion contains EOS tokens (should not with skip_special_tokens=True)
+    if "<|im_end|>" in completion or "<|endoftext|>" in completion:
+        print("  ⚠️  WARNING: Completion contains special tokens - skip_special_tokens may not be working!")
+    else:
+        print("  ✓ No special tokens in completion (skip_special_tokens=True working)")
+    
     print()
 
 
@@ -609,15 +611,24 @@ def main():
     
     # Set global tokenizer for chat template functions
     _tokenizer = tokenizer
+    
+    # Set global EOS token IDs for proper generation stopping
+    global _eos_token_ids
+    _eos_token_ids = get_eos_token_ids(tokenizer)
 
     if accelerator.is_main_process:
         print("Model loaded successfully\n")
+        print(f"[EOS Token IDs] Using {_eos_token_ids} for generation stopping")
         
         # Run verification checks
         verify_setup(tokenizer, accelerator, args)
         
         # Test completion extraction with a real generation
         verify_completion_extraction(model_list[0], tokenizer, accelerator)
+        
+        print(f"[Callbacks]")
+        print(f"  ✓ Stdout completion logging enabled (every {args.eval_steps} steps)")
+        print(f"  ✗ No wandb table logging for completions")
 
     for model in model_list:
         model.eval()
@@ -763,6 +774,7 @@ def main():
             # Log to wandb with consistent metric names
             if wandb_run is not None:
                 wandb_run.log({
+                    "iteration": iteration + 1,
                     # Training metrics - use same names as GRPO where applicable
                     "train/reward/mean": mean_reward,
                     "train/reward/min": min_reward,
@@ -791,6 +803,7 @@ def main():
                     if wandb_run is not None:
                         # Use consistent eval metric names
                         wandb_run.log({
+                            "iteration": iteration + 1,
                             "eval/reward": eval_mean,
                             "eval/rewards/reward_fn/mean": eval_mean,
                             "eval/reward/min": eval_min,
@@ -799,14 +812,20 @@ def main():
                             "eval/rewards/reward_fn/std": eval_std,
                         }, step=iteration + 1)
 
-                    # Log completions to both stdout and wandb
-                    log_eval_completions(
+                    # Log eval completions to stdout only (no wandb table)
+                    log_completions_to_stdout(
                         original_model, tokenizer, eval_dataset, accelerator,
-                        wandb_run=wandb_run,
                         step=iteration + 1,
-                        max_rows=int(args.eval_log_completions),
                         max_chars=int(args.eval_log_max_chars),
-                        seed=int(initial_seed),
+                        dataset_name="Eval",
+                    )
+                    
+                    # Log training completions to stdout only (no wandb table)
+                    log_completions_to_stdout(
+                        original_model, tokenizer, dataset, accelerator,
+                        step=iteration + 1,
+                        max_chars=int(args.eval_log_max_chars),
+                        dataset_name="Train",
                     )
 
         del rewards_tensor, rewards_normalized
