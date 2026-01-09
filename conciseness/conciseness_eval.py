@@ -1,6 +1,13 @@
 #!/usr/bin/env python
 """
-Unified evaluation script for ES and GRPO fine-tuned models on conciseness task.
+Optimized unified evaluation script for ES and GRPO fine-tuned models on conciseness task.
+
+Optimizations implemented:
+1. Batched generation - generate all samples for a question in one call
+2. Batched KL computation - compute KL for all samples in batched forward passes
+3. Multi-question batching - process multiple questions together
+4. torch.compile() - JIT compilation for faster inference
+5. Reduced memory operations - removed excessive empty_cache() calls
 
 Evaluates models by:
 - Computing length-based rewards comparing generated vs. target answers
@@ -11,10 +18,10 @@ Supports both ES and GRPO checkpoints via --algorithm flag.
 
 Usage:
     # Evaluate ES checkpoints
-    python conciseness_eval.py --algorithm es --sigma 0.001 --alpha 0.0005 ...
+    python conciseness_eval_optimized.py --algorithm es --sigma 0.001 --alpha 0.0005 ...
     
     # Evaluate GRPO checkpoints  
-    python conciseness_eval.py --algorithm grpo --beta 0.01 ...
+    python conciseness_eval_optimized.py --algorithm grpo --beta 0.01 ...
 
 Applies chat template and extracts completions correctly to match training.
 """
@@ -24,15 +31,17 @@ import json
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import logging
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import gc
 
 
 logging.set_verbosity_error()
 torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 def parse_args():
@@ -93,7 +102,23 @@ def parse_args():
                         default='/n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/GRPO',
                         help='Base directory for GRPO checkpoints')
     
+    # Optimization arguments
+    parser.add_argument('--question_batch_size', type=int, default=1,
+                        help='Number of questions to process in parallel')
+    parser.add_argument('--kl_batch_size', type=int, default=8,
+                        help='Batch size for KL computation')
+    parser.add_argument('--generation_batch_size', type=int, default=20,
+                        help='Batch size for generation (num_samples processed at once)')
+    parser.add_argument('--use_compile', action='store_true', default=False,
+                        help='Use torch.compile for model optimization')
+    parser.add_argument('--no_compile', action='store_true', default=False,
+                        help='Disable torch.compile')
+    
     args = parser.parse_args()
+    
+    # Handle compile flag
+    if args.no_compile:
+        args.use_compile = False
     
     # Validate algorithm-specific arguments
     if args.algorithm == 'es':
@@ -151,13 +176,14 @@ def compute_reward(generated_text: str, target_text: str) -> float:
     return -abs(len(gen_clean) - len(target_clean))
 
 
-def compute_per_token_logps(model, input_ids, attention_mask):
-    """Compute per-token log probabilities."""
+def compute_per_token_logps_batched(model, input_ids, attention_mask):
+    """Compute per-token log probabilities for a batch."""
     with torch.inference_mode():
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits
         log_probs = F.log_softmax(logits.float(), dim=-1)
 
+    # Shift for next-token prediction
     shift_log_probs = log_probs[:, :-1, :]
     shift_labels = input_ids[:, 1:]
     per_token_logps = torch.gather(shift_log_probs, dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
@@ -170,6 +196,8 @@ def force_memory_cleanup():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        # Additional cleanup
+        torch.cuda.reset_peak_memory_stats()
 
 
 def get_model_path(args, seed: int) -> str:
@@ -214,6 +242,12 @@ def verify_setup(tokenizer, args):
     else:
         print(f"  Beta: {args.beta}")
     
+    print(f"\n[Optimizations]")
+    print(f"  torch.compile: {args.use_compile}")
+    print(f"  Question batch size: {args.question_batch_size}")
+    print(f"  Generation batch size: {args.generation_batch_size}")
+    print(f"  KL batch size: {args.kl_batch_size}")
+    
     print(f"\n[Tokenizer]")
     print(f"  pad_token: {repr(tokenizer.pad_token)} (id={tokenizer.pad_token_id})")
     print(f"  eos_token: {repr(tokenizer.eos_token)} (id={tokenizer.eos_token_id})")
@@ -249,11 +283,92 @@ def verify_setup(tokenizer, args):
     print("\n" + "=" * 60 + "\n")
 
 
-def evaluate_single_model(model_path, baseline_model, tokenizer, dataset, device, dtype, args):
+def get_model_device(model):
+    """Get the device of the model's first parameter."""
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def generate_batched_samples(model, tokenizer, formatted_prompt, num_samples, args, device):
+    """
+    Generate multiple samples for a single prompt in a batched manner.
+    Handles sub-batching if num_samples > generation_batch_size.
+    Returns list of (full_ids, completion_ids, generated_answer, prompt_length) tuples.
+    """
+    # Get actual model device (may differ from passed device due to device_map="auto")
+    model_device = get_model_device(model)
+    
+    # Tokenize the prompt
+    tokenized = tokenizer(
+        [formatted_prompt],
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=False,
+    )
+    input_ids = tokenized["input_ids"].to(model_device)
+    attention_mask = tokenized["attention_mask"].to(model_device)
+    prompt_length = input_ids.shape[1]
+    
+    results = []
+    generation_batch_size = args.generation_batch_size
+    
+    # Process in sub-batches if needed
+    for batch_start in range(0, num_samples, generation_batch_size):
+        batch_size = min(generation_batch_size, num_samples - batch_start)
+        
+        # Expand for batch generation
+        batch_input_ids = input_ids.expand(batch_size, -1)
+        batch_attention_mask = attention_mask.expand(batch_size, -1)
+        
+        with torch.inference_mode():
+            outputs = model.generate(
+                batch_input_ids,
+                attention_mask=batch_attention_mask,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=args.do_sample,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+        
+        for i in range(batch_size):
+            full_ids = outputs[i]
+            completion_ids = full_ids[prompt_length:]
+            
+            try:
+                # Decode with skip_special_tokens=True to get clean text
+                generated_answer = tokenizer.decode(completion_ids, skip_special_tokens=True)
+            except TypeError:
+                tokens = tokenizer.convert_ids_to_tokens(completion_ids)
+                filtered = [t for t in tokens if t is not None]
+                generated_answer = tokenizer.convert_tokens_to_string(filtered)
+            
+            # Also try decoding without skipping to see raw output for debugging
+            generated_answer = generated_answer.strip()
+            
+            # If empty, the model may have only generated special tokens
+            # Try to get any content before special tokens
+            if not generated_answer:
+                raw_answer = tokenizer.decode(completion_ids, skip_special_tokens=False)
+                generated_answer = clean_completion(raw_answer)
+            
+            results.append((full_ids, completion_ids, generated_answer, prompt_length))
+    
+    return results
+
+
+def evaluate_single_model(model_path, tokenizer, dataset, device, dtype, args, baseline_model_name):
     """Evaluate a single model checkpoint and return results."""
     print(f"\nEvaluating model: {model_path}")
+    
+    # Force cleanup before loading new model
+    force_memory_cleanup()
 
-    # Load fine-tuned model
+    # Load fine-tuned model FIRST (before reference model)
+    print("  Loading fine-tuned model...")
     model_ft = AutoModelForCausalLM.from_pretrained(
         model_path,
         cache_dir=args.hf_cache_dir,
@@ -262,152 +377,291 @@ def evaluate_single_model(model_path, baseline_model, tokenizer, dataset, device
         attn_implementation="sdpa",
     )
     model_ft.eval()
+    
+    # Verify model is on expected device
+    ft_device = get_model_device(model_ft)
+    print(f"  Fine-tuned model device: {ft_device}")
+    
+    # Apply torch.compile if enabled
+    if args.use_compile:
+        print("  Applying torch.compile (this may take a moment on first run)...")
+        try:
+            model_ft = torch.compile(model_ft, mode="reduce-overhead")
+            print("  ✓ torch.compile applied successfully")
+        except Exception as e:
+            print(f"  ⚠️  torch.compile failed, continuing without: {e}")
 
     # Storage for all results
     all_rewards = []
     all_answer_token_counts = []
+    all_completions = []
+    
+    # Storage for sequences that need KL computation
+    all_sequences_for_kl = []
+    all_prompt_lengths_for_kl = []
+    sequence_to_question_sample_for_kl = []
+
+    # Process questions - GENERATION ONLY (no KL yet)
+    num_questions = len(dataset)
+    question_batch_size = args.question_batch_size
+    
+    for batch_start in range(0, num_questions, question_batch_size):
+        batch_end = min(batch_start + question_batch_size, num_questions)
+        questions_batch = dataset[batch_start:batch_end]
+        
+        print(f"  Generating for questions {batch_start + 1}-{batch_end}/{num_questions}...")
+        
+        for q_idx, (question, target_answer) in enumerate(questions_batch):
+            question_idx = batch_start + q_idx
+            formatted_prompt = format_prompt_with_chat_template(question)
+            
+            # Generate all samples for this question
+            generation_results = generate_batched_samples(
+                model_ft, tokenizer, formatted_prompt, args.num_samples, args, device
+            )
+            
+            question_completions = []
+            
+            for sample_idx, (full_ids, completion_ids, generated_answer, prompt_length) in enumerate(generation_results):
+                # Compute reward
+                reward = compute_reward(generated_answer, target_answer)
+                num_answer_tokens = len(completion_ids)
+                
+                completion_info = {
+                    "sample_idx": sample_idx,
+                    "completion": generated_answer,
+                    "completion_length": len(generated_answer),
+                    "target_length": len(target_answer),
+                    "reward": float(reward),
+                    "num_tokens": int(num_answer_tokens),
+                }
+                question_completions.append(completion_info)
+                
+                all_rewards.append(float(reward))
+                all_answer_token_counts.append(int(num_answer_tokens))
+                
+                # Store for KL computation later
+                all_sequences_for_kl.append(full_ids.cpu())  # Move to CPU to save GPU memory
+                all_prompt_lengths_for_kl.append(prompt_length)
+                sequence_to_question_sample_for_kl.append((question_idx, sample_idx))
+            
+            all_completions.append({
+                "question_idx": question_idx,
+                "question": question,
+                "target_answer": target_answer,
+                "completions": question_completions,
+            })
+            
+            # Print example if requested
+            if args.print_examples and len(question_completions) > 0:
+                print(f"\n    [Example] Question: {question}")
+                print(f"    [Example] Target: {target_answer} (len={len(target_answer)})")
+                print(f"    [Example] Generated: {question_completions[0]['completion']} (len={question_completions[0]['completion_length']})")
+                print(f"    [Example] Reward: {question_completions[0]['reward']:.2f}")
+        
+        # Periodic cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Check we have results
+    if len(all_rewards) == 0:
+        raise RuntimeError("No rewards computed. Check dataset and generation settings.")
+    
+    # Now compute KL divergence
+    # Strategy: Only load ONE model at a time to avoid OOM
+    # 1. Load fine-tuned model, compute all logprobs, save to CPU
+    # 2. Unload fine-tuned model
+    # 3. Load reference model, compute all logprobs, save to CPU
+    # 4. Compute KL on CPU
+    
+    print("  Computing KL divergence (phase 1: fine-tuned model logprobs)...")
+    
+    # Reload fine-tuned model
+    model_ft = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        cache_dir=args.hf_cache_dir,
+        device_map="auto", 
+        torch_dtype=dtype,
+        attn_implementation="sdpa",
+    )
+    model_ft.eval()
+    ft_device = get_model_device(model_ft)
+    
+    # Compute fine-tuned model logprobs for all sequences
+    all_ft_logps = []
+    num_sequences = len(all_sequences_for_kl)
+    kl_batch_size = args.kl_batch_size
+    
+    for batch_start in range(0, num_sequences, kl_batch_size):
+        batch_end = min(batch_start + kl_batch_size, num_sequences)
+        
+        if batch_start % (kl_batch_size * 5) == 0:
+            print(f"    FT logprobs batch {batch_start}-{batch_end}/{num_sequences}...")
+        
+        batch_sequences = all_sequences_for_kl[batch_start:batch_end]
+        
+        # Pad sequences
+        max_len = max(seq.shape[0] for seq in batch_sequences)
+        padded_ids = []
+        attention_masks = []
+        
+        for seq in batch_sequences:
+            seq_len = seq.shape[0]
+            if seq_len < max_len:
+                padding = torch.full((max_len - seq_len,), tokenizer.pad_token_id, dtype=seq.dtype)
+                padded_seq = torch.cat([seq, padding])
+                mask = torch.cat([torch.ones(seq_len), torch.zeros(max_len - seq_len)])
+            else:
+                padded_seq = seq
+                mask = torch.ones(seq_len)
+            padded_ids.append(padded_seq)
+            attention_masks.append(mask)
+        
+        batch_input_ids = torch.stack(padded_ids).to(ft_device)
+        batch_attention_mask = torch.stack(attention_masks).to(ft_device)
+        
+        # Compute logprobs
+        ft_logps = compute_per_token_logps_batched(model_ft, batch_input_ids, batch_attention_mask)
+        all_ft_logps.append(ft_logps.cpu())
+        
+        del batch_input_ids, batch_attention_mask, ft_logps
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    # Unload fine-tuned model
+    print("  Unloading fine-tuned model...")
+    del model_ft
+    force_memory_cleanup()
+    
+    # Load reference model
+    print("  Computing KL divergence (phase 2: reference model logprobs)...")
+    model_ref = AutoModelForCausalLM.from_pretrained(
+        baseline_model_name,
+        cache_dir=args.hf_cache_dir,
+        device_map="auto",
+        torch_dtype=dtype,
+        attn_implementation="sdpa",
+    )
+    model_ref.eval()
+    ref_device = get_model_device(model_ref)
+    
+    # Compute reference model logprobs for all sequences
+    all_ref_logps = []
+    
+    for batch_start in range(0, num_sequences, kl_batch_size):
+        batch_end = min(batch_start + kl_batch_size, num_sequences)
+        
+        if batch_start % (kl_batch_size * 5) == 0:
+            print(f"    Ref logprobs batch {batch_start}-{batch_end}/{num_sequences}...")
+        
+        batch_sequences = all_sequences_for_kl[batch_start:batch_end]
+        
+        # Pad sequences (same as before)
+        max_len = max(seq.shape[0] for seq in batch_sequences)
+        padded_ids = []
+        attention_masks = []
+        
+        for seq in batch_sequences:
+            seq_len = seq.shape[0]
+            if seq_len < max_len:
+                padding = torch.full((max_len - seq_len,), tokenizer.pad_token_id, dtype=seq.dtype)
+                padded_seq = torch.cat([seq, padding])
+                mask = torch.cat([torch.ones(seq_len), torch.zeros(max_len - seq_len)])
+            else:
+                padded_seq = seq
+                mask = torch.ones(seq_len)
+            padded_ids.append(padded_seq)
+            attention_masks.append(mask)
+        
+        batch_input_ids = torch.stack(padded_ids).to(ref_device)
+        batch_attention_mask = torch.stack(attention_masks).to(ref_device)
+        
+        # Compute logprobs
+        ref_logps = compute_per_token_logps_batched(model_ref, batch_input_ids, batch_attention_mask)
+        all_ref_logps.append(ref_logps.cpu())
+        
+        del batch_input_ids, batch_attention_mask, ref_logps
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    # Unload reference model
+    print("  Unloading reference model...")
+    del model_ref
+    force_memory_cleanup()
+    
+    # Now compute KL on CPU
+    print("  Computing KL divergence (phase 3: KL calculation on CPU)...")
     all_per_token_kls = []
     per_sample_kl_means = []
     
-    # Store ALL completions for JSON output
-    all_completions = []
-
-    for question_idx, (question, target_answer) in enumerate(dataset):
-        print(f"Processing question {question_idx + 1}/{len(dataset)}: {question[:50]}...")
-
-        # Apply chat template to question
-        formatted_prompt = format_prompt_with_chat_template(question)
+    batch_idx = 0
+    seq_idx_in_batch = 0
+    
+    for seq_idx in range(num_sequences):
+        # Find the right batch and position
+        while seq_idx_in_batch >= all_ft_logps[batch_idx].shape[0]:
+            seq_idx_in_batch = 0
+            batch_idx += 1
         
-        # Tokenize the formatted prompt
-        tokenized_inputs = tokenizer(
-            [formatted_prompt],
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False,  # Chat template already includes special tokens
-        )
-        input_ids = tokenized_inputs["input_ids"].to(device)
-        attention_mask = tokenized_inputs["attention_mask"].to(device)
-        prompt_length = input_ids.shape[1]
-
-        question_completions = []
-
-        for sample_idx in range(args.num_samples):
-            if args.num_samples > 1 and (sample_idx + 1) % 5 == 0:
-                print(f"  Sample {sample_idx + 1}/{args.num_samples}...")
-
-            with torch.inference_mode():
-                outputs = model_ft.generate(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=args.do_sample,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-
-            full_ids = outputs[0]
+        seq = all_sequences_for_kl[seq_idx]
+        prompt_len = all_prompt_lengths_for_kl[seq_idx]
+        seq_len = seq.shape[0]
+        
+        ft_logps_seq = all_ft_logps[batch_idx][seq_idx_in_batch]
+        ref_logps_seq = all_ref_logps[batch_idx][seq_idx_in_batch]
+        
+        # KL only on generated tokens (after prompt)
+        gen_start_idx = max(prompt_len - 1, 0)
+        
+        if gen_start_idx < ft_logps_seq.shape[0]:
+            ft_gen_logps = ft_logps_seq[gen_start_idx:seq_len-1]
+            ref_gen_logps = ref_logps_seq[gen_start_idx:seq_len-1]
             
-            # Extract completion only (not the prompt)
-            completion_ids = full_ids[prompt_length:]
+            # Get generated token ids for EOS truncation
+            generated_token_ids = seq[1:][gen_start_idx:seq_len-1]
             
-            try:
-                # Decode without skipping special tokens first, then clean
-                generated_answer = tokenizer.decode(completion_ids, skip_special_tokens=False)
-            except TypeError:
-                tokens = tokenizer.convert_ids_to_tokens(completion_ids)
-                filtered = [t for t in tokens if t is not None]
-                generated_answer = tokenizer.convert_tokens_to_string(filtered)
+            # Truncate at EOS
+            if tokenizer.eos_token_id is not None:
+                eos_positions = (generated_token_ids == tokenizer.eos_token_id).nonzero(as_tuple=False)
+                if eos_positions.numel() > 0:
+                    cutoff = eos_positions[0, 0].item() + 1
+                    ft_gen_logps = ft_gen_logps[:cutoff]
+                    ref_gen_logps = ref_gen_logps[:cutoff]
             
-            # Clean the completion (remove <|im_end|>, EOS, etc.)
-            generated_answer = clean_completion(generated_answer)
-
-            # Compute reward
-            reward = compute_reward(generated_answer, target_answer)
-            all_rewards.append(reward)
-
-            # Track token counts
-            num_answer_tokens = len(completion_ids)
-            all_answer_token_counts.append(int(num_answer_tokens))
-
-            # Store completion info
-            completion_info = {
-                "sample_idx": sample_idx,
-                "completion": generated_answer,
-                "completion_length": len(generated_answer),
-                "target_length": len(target_answer),
-                "reward": float(reward),
-                "num_tokens": int(num_answer_tokens),
-            }
-
-            # Compute KL divergence
-            full_input_ids = full_ids.unsqueeze(0).to(device)
-            full_attention_mask = torch.ones_like(full_input_ids, device=device)
-
-            ft_per_token_logps = compute_per_token_logps(model_ft, full_input_ids, full_attention_mask)
-            ref_per_token_logps = compute_per_token_logps(baseline_model, full_input_ids, full_attention_mask)
-
-            # KL only on generated tokens (after prompt)
-            gen_start_idx = max(prompt_length - 1, 0)
-            if gen_start_idx < ft_per_token_logps.shape[1]:
-                ft_generated_logps = ft_per_token_logps[:, gen_start_idx:]
-                ref_generated_logps = ref_per_token_logps[:, gen_start_idx:]
-
-                generated_token_ids = full_input_ids[:, 1:][:, gen_start_idx:]
-
-                # Truncate at EOS if present
-                if tokenizer.eos_token_id is not None:
-                    eos_positions = (generated_token_ids[0] == tokenizer.eos_token_id).nonzero(as_tuple=False)
-                    if eos_positions.numel() > 0:
-                        cutoff = eos_positions[0, 0].item() + 1
-                        ft_generated_logps = ft_generated_logps[:, :cutoff]
-                        ref_generated_logps = ref_generated_logps[:, :cutoff]
-
-                if ft_generated_logps.shape[1] > 0:
-                    # KL(ref || ft) using the formula: exp(log_ref - log_ft) - (log_ref - log_ft) - 1
-                    logp_diff = ref_generated_logps - ft_generated_logps
-                    per_token_kl = torch.exp(logp_diff) - logp_diff - 1
-                    per_token_kl = per_token_kl.squeeze(0)
-                    per_token_kl_list = per_token_kl.detach().cpu().tolist()
-
-                    if per_token_kl_list:
-                        all_per_token_kls.extend(per_token_kl_list)
-                        mean_kl_value = float(np.mean(per_token_kl_list))
-                        per_sample_kl_means.append(mean_kl_value)
-                        completion_info["mean_per_token_kl"] = mean_kl_value
-
-            question_completions.append(completion_info)
-
-            # Cleanup per-sample
-            del full_input_ids, full_attention_mask
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # Store all completions for this question
-        all_completions.append({
-            "question_idx": question_idx,
-            "question": question,
-            "target_answer": target_answer,
-            "completions": question_completions,
-        })
-
-        # Print example if requested
-        if args.print_examples and len(question_completions) > 0:
-            print(f"\n    [Example] Question: {question}")
-            print(f"    [Example] Target: {target_answer} (len={len(target_answer)})")
-            print(f"    [Example] Generated: {question_completions[0]['completion']} (len={question_completions[0]['completion_length']})")
-            print(f"    [Example] Reward: {question_completions[0]['reward']:.2f}")
-
-        # Cleanup per-question
-        del input_ids, attention_mask
-        force_memory_cleanup()
-
-    # Calculate metrics for this model
-    if len(all_rewards) == 0:
-        raise RuntimeError("No rewards computed. Check dataset and generation settings.")
+            if ft_gen_logps.shape[0] > 0:
+                logp_diff = ref_gen_logps - ft_gen_logps
+                per_token_kl = torch.exp(logp_diff) - logp_diff - 1
+                per_token_kl_list = per_token_kl.tolist()
+                
+                if per_token_kl_list:
+                    all_per_token_kls.extend(per_token_kl_list)
+                    per_sample_kl_means.append(float(np.mean(per_token_kl_list)))
+                else:
+                    per_sample_kl_means.append(float('nan'))
+            else:
+                per_sample_kl_means.append(float('nan'))
+        else:
+            per_sample_kl_means.append(float('nan'))
+        
+        seq_idx_in_batch += 1
+    
+    # Clean up logprobs
+    del all_ft_logps, all_ref_logps
+    
+    # Assign KL values back to completions
+    for seq_idx, (q_idx, sample_idx) in enumerate(sequence_to_question_sample_for_kl):
+        if seq_idx < len(per_sample_kl_means):
+            # Find the right completion
+            for comp_data in all_completions:
+                if comp_data["question_idx"] == q_idx:
+                    for comp in comp_data["completions"]:
+                        if comp["sample_idx"] == sample_idx:
+                            comp["mean_per_token_kl"] = per_sample_kl_means[seq_idx]
+                            break
+                    break
+    
+    # Final cleanup
+    force_memory_cleanup()
 
     mean_reward = float(np.mean(all_rewards))
     std_reward = float(np.std(all_rewards))
@@ -418,16 +672,22 @@ def evaluate_single_model(model_path, baseline_model, tokenizer, dataset, device
     normalized_mean_reward = (mean_reward + 2000) / 2001
     normalized_std_reward = std_reward / 2001
 
-    total_kl_tokens = len(all_per_token_kls)
-    mean_per_token_kl = float(np.mean(all_per_token_kls)) if total_kl_tokens > 0 else float('nan')
-    std_per_token_kl = float(np.std(all_per_token_kls)) if total_kl_tokens > 0 else float('nan')
+    # Compute KL statistics
+    # Filter out NaN values for KL computation
+    valid_kls = [kl for kl in all_per_token_kls if not np.isnan(kl)]
+    total_kl_tokens = len(valid_kls)
+    mean_per_token_kl = float(np.mean(valid_kls)) if total_kl_tokens > 0 else float('nan')
+    std_per_token_kl = float(np.std(valid_kls)) if total_kl_tokens > 0 else float('nan')
+
+    # Compute per-sample KL means
+    per_sample_kl_means = []
+    for completion_data in all_completions:
+        for comp in completion_data["completions"]:
+            if "mean_per_token_kl" in comp and not np.isnan(comp["mean_per_token_kl"]):
+                per_sample_kl_means.append(comp["mean_per_token_kl"])
 
     total_answer_tokens = int(np.sum(all_answer_token_counts))
     mean_answer_tokens = float(total_answer_tokens / len(all_answer_token_counts)) if all_answer_token_counts else float('nan')
-
-    # Clean up model
-    del model_ft
-    force_memory_cleanup()
 
     return {
         "reward": {
@@ -467,7 +727,7 @@ def main():
     
     # Print header
     print("=" * 80)
-    print("Conciseness Evaluation")
+    print("Conciseness Evaluation (OPTIMIZED)")
     print("=" * 80)
     print(f"Algorithm: {args.algorithm.upper()}")
     if args.algorithm == 'es':
@@ -484,6 +744,11 @@ def main():
     print(f"Temperature: {args.temperature}")
     print(f"Top-p: {args.top_p}")
     print(f"Num samples per prompt: {args.num_samples}")
+    print(f"\n[Optimization Settings]")
+    print(f"  torch.compile: {args.use_compile}")
+    print(f"  Question batch size: {args.question_batch_size}")
+    print(f"  Generation batch size: {args.generation_batch_size}")
+    print(f"  KL batch size: {args.kl_batch_size}")
     print("=" * 80)
 
     # Optional seeding for reproducibility
@@ -520,17 +785,8 @@ def main():
     # Verify setup
     verify_setup(tokenizer, args)
 
-    # Load reference model (shared across all evaluations)
-    print("Loading reference model...")
-    model_ref = AutoModelForCausalLM.from_pretrained(
-        args.baseline_model_name,
-        cache_dir=args.hf_cache_dir,
-        device_map="auto",
-        torch_dtype=dtype,
-        attn_implementation="sdpa",
-    )
-    model_ref.eval()
-    print("Reference model loaded successfully")
+    # Note: Reference model will be loaded per-seed in evaluate_single_model
+    # This avoids OOM from having both models loaded simultaneously
 
     # Load evaluation dataset
     print("\nLoading evaluation dataset...")
@@ -563,7 +819,7 @@ def main():
 
         try:
             seed_result = evaluate_single_model(
-                model_path, model_ref, tokenizer, dataset, device, dtype, args
+                model_path, tokenizer, dataset, device, dtype, args, args.baseline_model_name
             )
             seed_results[str(seed)] = seed_result
 
@@ -645,8 +901,9 @@ def main():
 
     # Prepare results payload
     results = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "algorithm": args.algorithm,
+        "optimized": True,
         "config": {
             "baseline_model_name": args.baseline_model_name,
             "eval_data_path": data_path,
@@ -657,6 +914,10 @@ def main():
             "top_p": args.top_p,
             "num_samples": args.num_samples,
             "seeds_requested": seeds,
+            "question_batch_size": args.question_batch_size,
+            "generation_batch_size": args.generation_batch_size,
+            "kl_batch_size": args.kl_batch_size,
+            "use_compile": args.use_compile,
         },
         "seed_results": seed_results,
         "aggregate": {
