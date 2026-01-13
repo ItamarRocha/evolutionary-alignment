@@ -442,7 +442,7 @@ def main():
                         "eval/decoded_length/mean": sum(lens) / len(lens) if lens else 0.0,
                         "eval/decoded_length/min": min(lens) if lens else 0,
                         "eval/decoded_length/max": max(lens) if lens else 0,
-                    }, step=step)
+                    })
                 except Exception:
                     pass
 

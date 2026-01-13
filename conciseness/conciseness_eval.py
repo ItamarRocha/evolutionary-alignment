@@ -96,10 +96,10 @@ def parse_args():
     parser.add_argument('--model_path_template', type=str, default=None,
                         help='Custom template for model path. Use {seed}, {sigma}, {alpha}, {beta} placeholders.')
     parser.add_argument('--es_base_dir', type=str, 
-                        default='/n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/ES',
+                        default='/n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/ES/final',
                         help='Base directory for ES checkpoints')
     parser.add_argument('--grpo_base_dir', type=str,
-                        default='/n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/GRPO',
+                        default='/n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/GRPO/final',
                         help='Base directory for GRPO checkpoints')
     
     # Optimization arguments
