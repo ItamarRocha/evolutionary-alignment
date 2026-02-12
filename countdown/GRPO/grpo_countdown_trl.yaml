@@ -1,0 +1,51 @@
+## TRL GRPO config for the Countdown task (Qwen-2.5-1.5B-Instruct)
+
+# Base model
+model_name: Qwen/Qwen2.5-1.5B-Instruct
+
+# HuggingFace cache (avoids filling home-dir quota on HPC)
+hf_cache_dir: /n/netscratch/sham_lab/Everyone/jbejjani/hf_cache
+
+# Data (train/eval split from countdown.json)
+# NOTE: prompts are built via chat template from numbers/target, NOT from the
+#       pre-baked "context" field in the JSON (which lacks special tokens).
+data_json: /n/holylabs/LABS/sham_lab/Users/jbejjani/evolutionary-alignment/countdown/data/countdown.json
+train_samples: 200
+numbers_key: numbers
+target_key: target
+
+# GRPO group size for Countdown (Appendix A.1: N = 8 common for GRPO)
+num_generations: 30
+
+# Lengths
+max_prompt_length: 512
+max_completion_length: 1024
+
+# Decoding during training
+temperature: 0.7
+top_p: 1.0
+
+# Optim defaults; learning_rate can be overridden by CLI
+learning_rate: 1.0e-6
+lr_scheduler_type: constant
+warmup_steps: 0
+num_train_epochs: 1
+max_steps: 500
+gradient_accumulation_steps: 16
+
+# Evaluation during training (every N steps; set eval_strategy to "no" to disable)
+eval_strategy: steps
+eval_steps: 25
+num_generations_eval: 4
+
+# Logging / output
+project: es_countdown
+entity: KURE-Spring-25
+report_to:
+  - wandb
+output_dir: /n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/countdown/GRPO
+save_steps: 200
+logging_steps: 10
+
+# Trainer specifics
+loss_type: grpo

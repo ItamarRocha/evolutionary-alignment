@@ -17,10 +17,16 @@ from datetime import datetime
 import gc
 import json
 import os
+import sys
 import random
 import shutil
 import time
 from typing import List, Dict, Any
+
+# Ensure repo root is on sys.path so `countdown.*` imports work regardless of cwd
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import ray
@@ -33,7 +39,7 @@ from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.utils import get_ip, get_open_port
 import tempfile
 
-from countdown_task import reward_function
+from countdown.countdown_task import reward_function
 
 # Default Hyperparameters
 SIGMA = 0.001
@@ -41,7 +47,6 @@ ALPHA = 0.0005
 POPULATION_SIZE = 30
 NUM_ENGINES = 4
 NUM_ITERATIONS = 500
-TRAIN_SAMPLES = 200
 EXPERIMENT_DIR = "es-countdown-accl"
 
 # GRPOZero align
@@ -75,9 +80,11 @@ def parse_args():
                         default="float16", help="Precision for model weights")
 
     # Data args
+    parser.add_argument("--train_samples", type=int, default=200,
+                        help="Number of samples from the JSON file to use for training (rest used for eval)")
     parser.add_argument("--data_path", type=str,
                         default="/n/holylabs/LABS/sham_lab/Users/jbejjani/evolutionary-alignment/countdown/data/countdown.json",
-                        help="Path to JSON data file (train=first TRAIN_SAMPLES, eval=rest)")
+                        help="Path to JSON data file (train=first --train_samples, eval=rest)")
     parser.add_argument("--max_new_tokens", type=int, default=1024,
                         help="Max new tokens for generation (train and eval)")
     parser.add_argument("--eval_interval", type=int, default=25,
@@ -287,6 +294,11 @@ def main(args):
     os.environ.pop("RAY_HEAD_IP", None)
     os.environ.pop("RAY_GCS_SERVER_ADDRESS", None)
 
+    # Ensure repo root is on PYTHONPATH so Ray workers can import `countdown` and `utils`
+    existing = os.environ.get("PYTHONPATH", "")
+    if _REPO_ROOT not in existing.split(os.pathsep):
+        os.environ["PYTHONPATH"] = _REPO_ROOT + (os.pathsep + existing if existing else "")
+
     unique_dir = tempfile.mkdtemp(prefix=f"ray_temp_session_{int(time.time())}_")
 
     ray.init(
@@ -323,12 +335,12 @@ def main(args):
 
     with open(args.data_path, "r") as f:
         all_task_datas = json.load(f)
-    task_datas = all_task_datas[:TRAIN_SAMPLES]
+    task_datas = all_task_datas[:args.train_samples]
     print(f"Loaded {len(task_datas)} train samples from {args.data_path}")
 
     eval_task_datas = []
     if args.eval_interval > 0:
-        eval_task_datas = all_task_datas[TRAIN_SAMPLES:]
+        eval_task_datas = all_task_datas[args.train_samples:]
         print(f"Loaded {len(eval_task_datas)} eval samples from {args.data_path}")
 
         # pre-process eval contexts

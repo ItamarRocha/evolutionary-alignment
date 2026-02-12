@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-node=4
-#SBATCH --time=1:00:00
+#SBATCH --time=6:00:00
 #SBATCH --mem=256G
 #SBATCH -o output/job.%N.%j.out          # STDOUT
 #SBATCH -e error/job.%N.%j.err           # STDERR
@@ -31,6 +31,7 @@ python es_accl_static.py \
   --num_engines 4 \
   --cuda_devices "0,1,2,3" \
   --num_iterations 500 \
+  --train_samples 200 \
   --eval_interval 25 \
   --max_new_tokens 1024 \
   --precision float16 \

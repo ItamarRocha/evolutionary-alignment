@@ -5,6 +5,8 @@ wandb/
 analysis/
 old/
 old_evals/
+*.err
+*.out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

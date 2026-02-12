@@ -28,6 +28,11 @@ import tempfile
 from datetime import datetime
 from typing import List, Dict, Any
 
+# Ensure repo root is on sys.path so `countdown.*` imports work regardless of cwd
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import numpy as np
 from vllm import LLM, SamplingParams, TokensPrompt
 from transformers import AutoTokenizer
@@ -348,11 +353,10 @@ def main():
     os.environ.pop("RAY_HEAD_IP", None)
     os.environ.pop("RAY_GCS_SERVER_ADDRESS", None)
 
-    # Ensure the repo root is on PYTHONPATH so Ray workers can import `utils`
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Ensure the repo root is on PYTHONPATH so Ray workers can import `countdown` and `utils`
     existing = os.environ.get("PYTHONPATH", "")
-    if repo_root not in existing.split(os.pathsep):
-        os.environ["PYTHONPATH"] = repo_root + (os.pathsep + existing if existing else "")
+    if _REPO_ROOT not in existing.split(os.pathsep):
+        os.environ["PYTHONPATH"] = _REPO_ROOT + (os.pathsep + existing if existing else "")
 
     unique_dir = tempfile.mkdtemp(prefix=f"ray_temp_session_{int(time.time())}_")
 
@@ -365,7 +369,7 @@ def main():
     )
 
     global reward_function
-    from countdown_task import reward_function
+    from countdown.countdown_task import reward_function
 
     if args.output_dir is None:
         model_name = os.path.basename(args.model_id.rstrip('/'))
