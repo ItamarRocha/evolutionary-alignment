@@ -34,6 +34,8 @@ gradient_accumulation_steps: 15
 # Logging / output
 project: conciseness_1_9
 entity: KURE-Spring-25
+report_to:
+  - wandb
 output_dir: /n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/GRPO/final
 save_steps: 500
 logging_steps: 5
