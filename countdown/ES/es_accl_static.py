@@ -319,9 +319,12 @@ def main(args):
     # W&B init
     if args.log_wandb:
         import wandb
+        # Extract short model name (e.g., "Qwen/Qwen2.5-1.5B-Instruct" -> "Qwen2.5-1.5B-Instruct")
+        short_model_name = args.model_name.split("/")[-1] if "/" in args.model_name else args.model_name
         wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
+            name=short_model_name,
             config=vars(args),
             dir=logging_dir,
         )
