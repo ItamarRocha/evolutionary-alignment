@@ -78,18 +78,24 @@ def find_nearest_checkpoint(markers: List[dict], target_iteration: int) -> Optio
     return nearest["iteration"], nearest["checkpoint_path"]
 
 
-def apply_perturbation(model: torch.nn.Module, seed: int, scale: float, device: str = "cpu"):
-    """Apply a single perturbation to model parameters using the seed."""
+def apply_perturbation(model: torch.nn.Module, seed: int, scale: float, device: str = None):
+    """Apply a single perturbation to model parameters using the seed.
+
+    Device defaults to the model's parameter device to match training behavior.
+    WARNING: PyTorch generators produce different sequences on CPU vs CUDA,
+    so device must match what was used during training.
+    """
     for name, param in model.named_parameters():
-        gen = torch.Generator(device=device)
+        dev = device or str(param.device)
+        gen = torch.Generator(device=dev)
         gen.manual_seed(int(seed))
-        noise = torch.randn(param.shape, dtype=param.dtype, device=device, generator=gen)
+        noise = torch.randn(param.shape, dtype=param.dtype, device=dev, generator=gen)
         param.data.add_(scale * noise)
         del noise
 
 
-def replay_iteration(model: torch.nn.Module, seeds: List[int], update_coeffs: List[float], 
-                     device: str = "cpu"):
+def replay_iteration(model: torch.nn.Module, seeds: List[int], update_coeffs: List[float],
+                     device: str = None):
     """Replay a single iteration's updates."""
     for seed, coeff in zip(seeds, update_coeffs):
         apply_perturbation(model, seed, coeff, device)
@@ -99,7 +105,7 @@ def reconstruct_checkpoint(
     replay_dir: str,
     target_iteration: int,
     output_path: Optional[str] = None,
-    device: str = "cpu",
+    device: str = "cuda",
     verbose: bool = True,
 ) -> Tuple[torch.nn.Module, dict]:
     """
@@ -250,10 +256,12 @@ def main():
         help="Path to save reconstructed model weights (.pth)"
     )
     parser.add_argument(
-        "--device", 
-        type=str, 
-        default="cpu",
-        help="Device to use (cpu or cuda:X)"
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device to use for reconstruction. Must match training device (default: cuda). "
+             "WARNING: CPU and CUDA produce different random sequences, so using the wrong "
+             "device will produce incorrect reconstructed weights."
     )
     parser.add_argument(
         "--quiet", 
