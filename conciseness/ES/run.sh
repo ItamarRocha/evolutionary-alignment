@@ -11,7 +11,7 @@
 #SBATCH --output=logs/es_conciseness_%A_%a.log
 #SBATCH --mail-user=jbejjani@college.harvard.edu
 #SBATCH --mail-type=ALL
-#SBATCH --array=0
+#SBATCH --array=0-3
 
 # Load modules
 module load python/3.12.11-fasrc02
@@ -19,8 +19,7 @@ module load cuda/12.9.1-fasrc01
 module load cudnn/9.10.2.21_cuda12-fasrc01
 
 # Activate conda environment
-mamba deactivate
-mamba activate /n/holylabs/LABS/sham_lab/Users/jbejjani/envs/evolutionary-alignment
+source activate /n/holylabs/LABS/sham_lab/Users/jbejjani/envs/evolutionary-alignment
 
 accelerate launch \
     --num_processes 4 \
@@ -29,9 +28,9 @@ accelerate launch \
     es_fine-tuning_conciseness_iid.py \
     --model_name Qwen/Qwen2.5-7B-Instruct \
     --hf_cache_dir /n/netscratch/sham_lab/Everyone/jbejjani/hf_cache \
-    --output_dir /n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/ES \
-    --wandb_project conciseness \
-    --wandb_entity KURE-SPRING-25 \
+    --output_dir /n/netscratch/sham_lab/Everyone/jbejjani/evolutionary-alignment/conciseness/ES/final \
+    --wandb_project conciseness_1_9 \
+    --wandb_entity KURE-Spring-25 \
     --gpu_threads 1 \
     --max_new_tokens 128 \
     --iterations 1000 \
