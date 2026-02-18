@@ -40,6 +40,8 @@ import time
 
 import numpy as np
 import ray
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import wandb
@@ -230,25 +232,39 @@ def parse_args():
 
 class ESNcclLLM(LLM):
     def __init__(self, *args, **kwargs):
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         super().__init__(*args, **kwargs)
 
 
 def launch_engines(num_engines, model_name):
-    """Launch vLLM engines with NCCL worker extension."""
+    """Launch vLLM engines with placement groups and NCCL worker extension."""
+    pgs = [placement_group([{"GPU": 1, "CPU": 0}], lifetime="detached") for _ in range(num_engines)]
+    ray.get([pg.ready() for pg in pgs])
+
+    strategies = [
+        PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=0,
+        )
+        for pg in pgs
+    ]
+
     engines = [
-        ray.remote(num_cpus=8, num_gpus=1)(ESNcclLLM).remote(
+        ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(ESNcclLLM).remote(
             model=model_name,
             tensor_parallel_size=1,
-            distributed_executor_backend="mp",
+            distributed_executor_backend="ray",
             worker_extension_cls="utils.worker_extn.WorkerExtension",
             dtype="float16",
             enable_prefix_caching=False,
             enforce_eager=False,
+            gpu_memory_utilization=0.9,
         )
-        for _ in range(num_engines)
+        for strategy in strategies
     ]
-    return engines
+    return engines, pgs
 
 
 def load_math_verifier_module():
@@ -508,7 +524,7 @@ def main(args):
 
     # Launch vLLM engines
     print(f"\nLaunching {args.num_engines} vLLM engines...")
-    engines = launch_engines(args.num_engines, base_model_path)
+    engines, pgs = launch_engines(args.num_engines, base_model_path)
     print(f"✅ Submitted {len(engines)} engines")
 
     # Init inter-engine NCCL communicator
@@ -527,6 +543,11 @@ def main(args):
                 ray.kill(llm)
             except Exception:
                 pass
+        for pg in pgs:
+            try:
+                remove_placement_group(pg)
+            except Exception:
+                pass
         ray.shutdown()
 
     def sig_handler(sig, frame):
@@ -542,13 +563,13 @@ def main(args):
         total_iter_start = time.time()
 
         # Random seeds for population
-        seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
+        loop_rng = np.random.default_rng(seed=(args.global_seed or 42) + i)
+        seeds = loop_rng.integers(0, 2**30, size=args.population_size, dtype=np.int64).tolist()
         seeds_perf = {}
 
         # Round-robin scheduling
         seed_iter = iter(seeds)
         inflight = {}
-        all_rewards_samples = []
 
         # Sample prompts for this iteration
         bs = min(args.batch_size, len(train_pairs))
@@ -585,13 +606,13 @@ def main(args):
             elapsed = time.time() - meta["start_ts"]
 
             rewards_np = np.asarray(metrics["per_sample_reward"], dtype=np.float32)
-            all_rewards_samples.extend(rewards_np.tolist())
             r_eff = rewards_np
             r_mean = float(r_eff.mean())
 
             if args.standardize_within_batch:
                 r_std = float(r_eff.std()) + 1e-8
-                r_mean /= r_std
+                r_eff = (r_eff - r_mean) / r_std
+                r_mean = float(r_eff.mean())
 
             seeds_perf[meta["seed"]] = {
                 **metrics,
@@ -644,16 +665,18 @@ def main(args):
                 'train/accuracy': reward_mean,
             }, step=i)
 
-        # ES weight update on engine 0
+        # ES weight update on engine 0 (batched FP32 accumulation)
+        coeffs = [float(seeds_perf[seed]["norm_reward"]) for seed in seeds]
+        ray.get(engines[0].collective_rpc.remote(
+            "update_weights_from_seeds",
+            args=(seeds, coeffs, args.alpha, args.population_size)
+        ))
+
+        # Compute per-seed coefficients for replay log compatibility
         per_seed_coeffs = [
             (seed, (args.alpha / args.population_size) * float(seeds_perf[seed]["norm_reward"]))
             for seed in seeds
         ]
-
-        handles = []
-        for seed, coeff in per_seed_coeffs:
-            handles.append(engines[0].collective_rpc.remote("perturb_self_weights", args=(seed, coeff, False)))
-        ray.get(handles)
 
         # Log to replay log (before broadcast, captures the update)
         if replay_log is not None:
