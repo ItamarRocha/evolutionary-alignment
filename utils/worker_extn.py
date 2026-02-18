@@ -1,6 +1,9 @@
 import gc
 import time
+import random
+import numpy as np
 import torch
+import os
 
 def _stateless_init_process_group(master_address, master_port, rank, world_size, device):
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -15,12 +18,23 @@ class WorkerExtension:
     Methods used by the ES trainer:
     - perturb_self_weights(seed, sigma_or_scale, coeff=1.0, negate=False)
     - restore_self_weights(seed, SIGMA)
+    - update_weights_from_seeds(seeds, coeffs)  <-- NEW METHOD
     - init_inter_engine_group(master_address, master_port, rank, world_size)
     - broadcast_all_weights(src_rank)
     - save_self_weights_to_disk(filepath)
     """
+    def _set_seed(self, seed):
+        # set a seed locally on the worker extension for reproducibility
+        self.local_seed = seed
+
+        # seeding
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
     def perturb_self_weights(self, seed, noise_scale, negate=False):
+        self._set_seed(seed)
         scale = float(noise_scale)
         sign = -1.0 if negate else 1.0
         for _, p in self.model_runner.model.named_parameters():
@@ -35,12 +49,52 @@ class WorkerExtension:
         return True
 
     def restore_self_weights(self, seed, SIGMA):
+        self._set_seed(seed)
         for _, p in self.model_runner.model.named_parameters():
             gen = torch.Generator(device=p.device)
             gen.manual_seed(int(seed))
             noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
             p.data.add_(-float(SIGMA) * noise)
             del noise
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return True
+
+    def update_weights_from_seeds(self, seeds, coeffs, alpha, population_size):
+        """
+        Mimics the Original implementation's update loop structure:
+        Iterate Param -> Iterate Seeds -> Accumulate -> Single Update.
+        """
+        # seeds and coeffs should be lists of equal length
+        # coeffs[i] should be: (alpha / population_size) * normalized_reward
+        
+        for _, p in self.model_runner.model.named_parameters():
+            # float32
+            update_accumulator = torch.zeros_like(p.data, dtype=torch.float32)
+            
+            for i, seed in enumerate(seeds):
+                self._set_seed(seed)
+                gen = torch.Generator(device=p.device)
+                gen.manual_seed(int(seed))
+                
+                # Generate noise (in native precision, usually float16/bfloat16)
+                noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
+                
+                # Better update stability
+                term = noise.to(torch.float32) * coeffs[i]
+                
+                # Accumulate in FP32
+                update_accumulator.add_(term)
+            
+            # div by population_size multiply by alpha (scalar)
+            update_accumulator.div_(population_size)
+            update_accumulator.mul_(alpha)
+            # Apply final update to weight (cast back to model dtype at the very end)
+            p.data.add_(update_accumulator.to(p.dtype))
+            
+            del update_accumulator
+            
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -69,39 +123,38 @@ class WorkerExtension:
             torch.cuda.empty_cache()
         time.sleep(0.1)
         return True
-
-    def load_self_weights_from_disk(self, filepath, strict: bool = False):
+    
+    def load_weights_from_disk(self, filepath):
+        state_dict = torch.load(filepath, map_location=self.device)
+        for name, p in self.model_runner.model.named_parameters():
+            p.data.copy_(state_dict[name].to(self.device))
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        time.sleep(0.1)
+        return True
+    
+    def dump_noise_for_seed(self, seed: int, out_dir: str):
         """
-        Load a fused vLLM state_dict that was previously saved by save_self_weights_to_disk.
-        - Assumes keys match the engine's fused param names (qkv_proj, gate_up_proj, etc.)
-        - Moves tensors to the current device and model dtype.
+        Generate per-parameter noise using the same method as perturb/restore
+        and save them to disk for determinism comparison.
         """
-        import os
-        assert os.path.exists(filepath), f"Checkpoint not found: {filepath}"
-
-        # Load to CPU first to avoid GPU spikes, then move to model device/dtype
-        sd = torch.load(filepath, map_location="cpu")
-
-        # Ensure dtype/device match the live model
-        model = self.model_runner.model
-        target_device = next(model.parameters()).device
-        target_dtype  = next(model.parameters()).dtype
-
-        for k, v in sd.items():
-            if isinstance(v, torch.Tensor):
-                # Move without extra copies where possible
-                v = v.to(device=target_device, dtype=target_dtype, non_blocking=True)
-                sd[k] = v
-
-        # Load (strict=False by default to tolerate minor head/vocab diffs)
-        missing, unexpected = model.load_state_dict(sd, strict=strict)
-
-        # Cleanup
-        del sd
+        os.makedirs(out_dir, exist_ok=True)
+        noise_state = {}
+        for name, p in self.model_runner.model.named_parameters():
+            gen = torch.Generator(device=p.device)
+            gen.manual_seed(int(seed))
+            noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
+            noise_state[name] = noise.detach().cpu()
+            del noise
+        torch.save(noise_state, os.path.join(out_dir, f"noise_seed_{int(seed)}.pt"))
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-        gc.collect()
-
-        # Return something small so ray.get(...) completes
-        return {"missing": list(missing)[:5], "unexpected": list(unexpected)[:5]}
+        return True
+    
+    # debug
+    def print_model_weights_stats(self):
+        for name, p in self.model_runner.model.named_parameters():
+            print(f"Param: {name}, Shape: {p.shape}")
+        return True

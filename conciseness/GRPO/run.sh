@@ -2,29 +2,27 @@
 #SBATCH --job-name=trl_grpo_conciseness
 #SBATCH --account=kempner_sham_lab
 #SBATCH --partition=kempner_h100
-#SBATCH --output=logs/trl_grpo_conciseness_%A_%a.log
+#SBATCH --output=logs/beta0.1/trl_grpo_conciseness_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
-#SBATCH --time=24:00:00
+#SBATCH --time=05:00:00
 #SBATCH --mem=256GB
 #SBATCH --mail-user=jbejjani@college.harvard.edu
 #SBATCH --mail-type=ALL
-#SBATCH --array=0-1%2
-
-set -euo pipefail
+#SBATCH --array=0-3%2
 
 module load python/3.12.11-fasrc02
 module load cuda/12.9.1-fasrc01
 module load cudnn/9.10.2.21_cuda12-fasrc01
 
-mamba deactivate
-mamba activate /n/holylabs/LABS/sham_lab/Users/jbejjani/envs/evolutionary-alignment
+# Activate conda environment
+source activate /n/holylabs/LABS/sham_lab/Users/jbejjani/envs/evolutionary-alignment
 
 CONFIG=${CONFIG:-grpo_conciseness_trl.yaml}
-BETAS=(0.0 0.0464) # (0.0 0.01 0.0167 0.0464)
-SEEDS=(0) # (0 1 2 3)
+BETAS=(0.1) # (0.0 0.01 0.0167 0.0464)
+SEEDS=(0 1 2 3) # (0 1 2 3)
 NB=${#BETAS[@]}
 NS=${#SEEDS[@]}
 IDX=${SLURM_ARRAY_TASK_ID}

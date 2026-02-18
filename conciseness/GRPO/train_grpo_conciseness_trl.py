@@ -244,22 +244,35 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--beta", type=float, required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--learning_rate", type=float, default=None, help="Override LR from config")
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
     cfg.setdefault("project", "es_conciseness")
     cfg.setdefault("entity", None)
 
+    # ── HF cache dir (must be set before any from_pretrained calls) ──
+    hf_cache_dir = cfg.get("hf_cache_dir")
+    if hf_cache_dir is not None:
+        os.environ["HF_HOME"] = hf_cache_dir
+        os.environ["HUGGINGFACE_HUB_CACHE"] = hf_cache_dir
+
     import torch
     import random
     import numpy as np
 
-    # Repro
-    torch.manual_seed(args.seed)
+    # ── Reproducibility (before any model / data loading) ──
     random.seed(args.seed)
     np.random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
+    except Exception:
+        pass
 
     from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
@@ -270,11 +283,7 @@ def main():
     os.environ["WANDB_PROJECT"] = str(cfg["project"])
 
     # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg["model_name"],
-        use_fast=False,
-        cache_dir=cfg.get("hf_cache_dir", "hf_cache")
-    )
+    tokenizer = AutoTokenizer.from_pretrained(cfg["model_name"], use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -288,20 +297,28 @@ def main():
 
     # GRPO Config
     use_vllm = bool(int(os.environ.get("USE_VLLM", "0")))
+    lr = float(args.learning_rate) if args.learning_rate is not None else float(cfg["learning_rate"])
+
+    # Reporting: configurable via YAML (default: ["wandb"])
+    report_to = cfg.get("report_to", ["wandb"])
+    if isinstance(report_to, str):
+        report_to = [report_to]
 
     grpo_args = GRPOConfig(
-        output_dir=os.path.join(cfg["output_dir"], f"beta{args.beta}_seed{args.seed}"),
+        output_dir=os.path.join(cfg["output_dir"], f"beta{args.beta}_lr{lr}_seed{args.seed}"),
+        seed=args.seed,
+        data_seed=args.seed,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
-        learning_rate=cfg["learning_rate"],
+        learning_rate=lr,
         lr_scheduler_type=cfg.get("lr_scheduler_type", "constant"),
         warmup_steps=cfg.get("warmup_steps", 0),
         num_train_epochs=cfg.get("num_train_epochs", 1),
         max_steps=cfg.get("max_steps", 1000),
         logging_steps=cfg.get("logging_steps", 5),
         save_steps=cfg.get("save_steps", 200),
-        report_to=["wandb"],
-        run_name=f"qwen2.5-7b_grpo_conciseness_beta{args.beta}_seed{args.seed}",
+        report_to=report_to,
+        run_name=f"qwen2.5-7b_grpo_conciseness_beta{args.beta}_lr{lr}_seed{args.seed}",
         bf16=True,
         remove_unused_columns=False,
 
@@ -319,12 +336,8 @@ def main():
         # vLLM
         use_vllm=use_vllm,
 
-        # Let accelerate handle deepspeed
-        deepspeed=None,
-
-        # Reproducibility
-        seed=args.seed,
-        data_seed=args.seed,
+        # deepspeed config path if any
+        deepspeed=cfg.get("deepspeed_config") or None,
 
         # Evaluation
         do_eval=eval_ds is not None,
