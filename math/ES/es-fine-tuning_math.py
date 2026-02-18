@@ -215,7 +215,13 @@ def parse_args():
                         help='Save compact replay logs for checkpoint reconstruction')
     parser.add_argument("--global_seed", type=int, default=42,
                         help="Global random seed")
-    
+
+    # Resume support
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None,
+                        help='Path to .pth checkpoint to resume from')
+    parser.add_argument('--start_iteration', type=int, default=0,
+                        help='Iteration to resume from (must match checkpoint)')
+
     args = parser.parse_args()
     
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
@@ -557,8 +563,19 @@ def main(args):
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
+    # Resume from checkpoint if specified
+    if args.resume_from_checkpoint:
+        print(f"\n🔄 Resuming from checkpoint: {args.resume_from_checkpoint}")
+        print(f"   Starting at iteration: {args.start_iteration}")
+        for eng in engines:
+            ray.get(eng.collective_rpc.remote(
+                "load_self_weights_from_disk", args=(args.resume_from_checkpoint,)
+            ))
+        ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
+        print(f"✅ Checkpoint loaded, resuming from iteration {args.start_iteration}")
+
     # Main training loop
-    for i in range(args.num_iterations):
+    for i in range(args.start_iteration, args.num_iterations):
         print(f"\n=== Iteration {i} ===")
         total_iter_start = time.time()
 
