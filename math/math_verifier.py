@@ -4,11 +4,11 @@ from tqdm import tqdm
 import jsonlines
 import os
 import re
+import resource
+import signal
+
 import numpy as np
 import torch
-import re
-import os
-import signal
 import json
 import hashlib
 from pathlib import Path
@@ -29,8 +29,6 @@ def reward_func(queries, prompts, answers):
             acc = 0.0
         scores.append(acc)
 
-    rewards = torch.tensor(scores, dtype=torch.float)
-    
     return {
            "rewards": torch.tensor(scores, dtype=torch.float)   # Required: Scores for dynamic filtering (0-1
        }
@@ -125,6 +123,7 @@ def execute_code(text):
 
 def parse_text_answer(text):
     answer = parse(text)
+    return answer
 
 def get_llm_answer(text):
     response_type = 'text'

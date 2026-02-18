@@ -268,6 +268,9 @@ def compute_pass_at_k_curve(
                 pass_at_k_values.append(0.0)
             elif c >= k:
                 pass_at_k_values.append(1.0)
+            elif n - c < k:
+                # Fewer incorrect samples than k, guaranteed to pick at least one correct
+                pass_at_k_values.append(1.0)
             else:
                 # Use log for numerical stability
                 # 1 - C(n-c, k) / C(n, k)
