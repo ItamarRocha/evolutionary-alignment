@@ -569,7 +569,7 @@ def main(args):
         print(f"   Starting at iteration: {args.start_iteration}")
         for eng in engines:
             ray.get(eng.collective_rpc.remote(
-                "load_self_weights_from_disk", args=(args.resume_from_checkpoint,)
+                "load_weights_from_disk", args=(args.resume_from_checkpoint,)
             ))
         ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
         print(f"✅ Checkpoint loaded, resuming from iteration {args.start_iteration}")

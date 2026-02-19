@@ -149,34 +149,32 @@ echo "============================================================"
 echo "STEP 3: Evaluating ES vs Base"
 echo "============================================================"
 
-# Check if ES checkpoint exists
+# If a .pth checkpoint exists, note that reconstruction may still be needed in some workflows.
 if [ -f "${ES_CHECKPOINT}" ]; then
-    # Need to reconstruct checkpoint from .pth file
-    echo "Note: ES checkpoint is a .pth file. You may need to reconstruct it first."
-    echo "Use: python ES/reconstruct_checkpoint.py --replay_log_dir <path> --target_iteration 800"
+    echo "Note: ES checkpoint .pth found at ${ES_CHECKPOINT}."
+    echo "If needed, reconstruct with: python ES/reconstruct_checkpoint.py --replay_log_dir <path> --target_iteration 800"
     echo ""
-    echo "Skipping ES evaluation for now..."
+fi
+
+ES_HF_CKPT="/n/netscratch/kempner_sham_lab/Lab/itamarf/es-fine-tuning-paper/math/es-ft-experiment/es_math_20260112_140425/model_saves/checkpoint_iter_800"
+if [ -d "${ES_HF_CKPT}" ]; then
+    python math_eval.py \
+        --model_path ${ES_HF_CKPT} \
+        --baseline_model ${BASE_MODEL} \
+        --datasets ${DATASETS} \
+        --num_samples ${NUM_SAMPLES} \
+        --kmax ${NUM_SAMPLES} \
+        --temperature ${TEMPERATURE} \
+        --top_p ${TOP_P} \
+        --max_new_tokens ${MAX_NEW_TOKENS} \
+        --output_dir ${OUTPUT_DIR} \
+        --output_json es_vs_base_results.json \
+        --gpu_memory_utilization 0.9 \
+        --seed 42
+    echo "ES evaluation complete."
 else
-    ES_HF_CKPT="/n/netscratch/kempner_sham_lab/Lab/itamarf/es-fine-tuning-paper/math/es-ft-experiment/es_math_20260112_140425/model_saves/checkpoint_iter_800"
-    if [ -d "${ES_HF_CKPT}" ]; then
-        python math_eval.py \
-            --model_path ${ES_HF_CKPT} \
-            --baseline_model ${BASE_MODEL} \
-            --datasets ${DATASETS} \
-            --num_samples ${NUM_SAMPLES} \
-            --kmax ${NUM_SAMPLES} \
-            --temperature ${TEMPERATURE} \
-            --top_p ${TOP_P} \
-            --max_new_tokens ${MAX_NEW_TOKENS} \
-            --output_dir ${OUTPUT_DIR} \
-            --output_json es_vs_base_results.json \
-            --gpu_memory_utilization 0.9 \
-            --seed 42
-        echo "ES evaluation complete."
-    else
-        echo "ES checkpoint not found at ${ES_HF_CKPT}"
-        echo "Please provide a valid HuggingFace format checkpoint."
-    fi
+    echo "ES checkpoint not found at ${ES_HF_CKPT}"
+    echo "Please provide a valid HuggingFace format checkpoint."
 fi
 
 echo ""
