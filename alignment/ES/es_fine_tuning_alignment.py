@@ -1,0 +1,1219 @@
+import argparse
+from datetime import datetime
+import gc
+import json
+import os
+import random
+import requests
+import shutil
+import signal
+import sys
+import time
+
+import numpy as np
+import ray
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+import torch
+from torch.utils.tensorboard import SummaryWriter
+import wandb
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
+from vllm.utils import get_ip, get_open_port
+
+# Make local Safe-RLHF package importable for workers if needed
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'safe-rlhf'))
+from datasets import load_dataset
+
+# Default Hyperparameters
+SIGMA = 0.001
+ALPHA = 0.0005
+POPULATION_SIZE = 30
+NUM_ENGINES = 4  # 4 engines like countdown
+NUM_ITERATIONS = 1000
+EXPERIMENT_DIR = "/n/netscratch/kempner_sham_lab/Lab/itamarf/es-fine-tuning-paper/alignment/es-ft-experiment"
+
+# Minimal local prompt formatting to avoid importing Safe-RLHF on drivers/workers
+PROMPT_BEGIN: str = 'BEGINNING OF CONVERSATION: '
+PROMPT_USER: str = 'USER: {input} '
+PROMPT_ASSISTANT: str = 'ASSISTANT:'
+
+def format_prompt_local(user_input: str, eos_token: str) -> str:
+    # We only need a single-turn user prompt followed by ASSISTANT:
+    return ''.join([PROMPT_BEGIN, PROMPT_USER.format(input=user_input), PROMPT_ASSISTANT])
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="ES Fine-tuning for Alignment (PKU objective) with multi-engine NCCL sync and external scorer API"
+    )
+    parser.add_argument("--policy_model_path", type=str, default="/n/netscratch/kempner_sham_lab/Lab/itamarf/es-fine-tuning-paper/models/alpaca-7b")
+    parser.add_argument("--sigma", type=float, default=SIGMA)
+    parser.add_argument("--alpha", type=float, default=ALPHA)
+    parser.add_argument("--population_size", type=int, default=POPULATION_SIZE)
+    parser.add_argument("--num_engines", type=int, default=NUM_ENGINES)
+    parser.add_argument("--num_iterations", type=int, default=NUM_ITERATIONS)
+    parser.add_argument("--experiment_dir", type=str, default=EXPERIMENT_DIR)
+    parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
+    parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
+    parser.add_argument('--max_new_tokens', type=int, default=512, help='Maximum number of tokens allowed to be generated')
+    
+    # Scorer API configuration
+    parser.add_argument("--scorer_url", type=str, default="http://localhost:8000", help="URL of the scorer API service")
+    
+    # Dataset and training args
+    parser.add_argument('--lambda_cost', type=float, default=1.0)
+    parser.add_argument('--train_samples', type=int, default=250)
+    parser.add_argument('--eval_samples', type=int, default=500)
+    parser.add_argument('--train_jsonl', type=str, default='alignment/data/train_250_eval_500/custom_train_250.jsonl')
+    parser.add_argument('--eval_jsonl', type=str, default='alignment/data/train_250_eval_500/custom_eval_500.jsonl')
+    parser.add_argument('--batch_size', type=int, default=200, help='Number of prompts to sample per iteration for ES fitness')
+    parser.add_argument('--standardize_within_batch', action='store_true', default=False,
+                        help='Standardize reward and cost within mini-batch before combining')
+    parser.add_argument('--safe_first', action='store_true', default=False,
+                        help='Apply safe-first gating: zero or downweight reward when cost>0')
+    parser.add_argument('--safe_first_factor', type=float, default=0.0,
+                        help='Multiplier for reward when cost>0 (0.0 => hard gate)')
+    parser.add_argument('--lambda_adapt', action='store_true', default=False,
+                        help='Enable Lagrangian lambda adaptation')
+    parser.add_argument('--lambda_lr', type=float, default=0.01, help='Learning rate for ln(lambda) update')
+    parser.add_argument('--lambda_min', type=float, default=1e-4)
+    parser.add_argument('--lambda_max', type=float, default=10.0)
+    parser.add_argument('--lambda_pos_cost_only', action='store_true', default=False,
+                        help='Use mean(max(C,0)) as J_C for lambda update')
+    parser.add_argument('--jc_ema_beta', type=float, default=0.9,
+                    help='EMA smoothing factor for J_C used in lambda update.')
+    parser.add_argument('--cost_threshold_d', type=float, default=0.0,
+                    help='Safety threshold d in J_C = E[C] + d (Safe-RLHF constraint).')
+    parser.add_argument('--eval_every', type=int, default=50)
+    parser.add_argument('--wandb_project', type=str, default='alignment_accl')
+    parser.add_argument('--wandb_run_name', type=str, default='')
+    parser.add_argument('--scorer_batch_size', type=int, default=16)
+    parser.add_argument('--save_every', type=int, default=100, help='Save HF-format latest checkpoint every N iters (0=off)')
+    parser.add_argument("--global_seed", type=int, help="Global random seed")
+    parser.add_argument("--resume_from", type=str, default=None, 
+                        help="Path to checkpoint directory to resume from (e.g., alignment_nccl_YYYYMMDD_HHMMSS)")
+    
+    # Seed-based checkpoint saving (compact replay logs)
+    parser.add_argument("--save_replay_log", action="store_true", default=False,
+                        help="Save compact replay logs (seeds + update coefficients) every iteration")
+    parser.add_argument("--full_checkpoint_every", type=int, default=0,
+                        help="Save full model checkpoint every N iterations (0=only at end). "
+                             "Use with --save_replay_log for hybrid checkpointing.")
+    
+    args = parser.parse_args()
+    
+    # Optional: scope host visibility; vLLM actors will ignore it and pick device from PG
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+
+    # set global random seed
+    if args.global_seed is not None:
+        random.seed(args.global_seed)
+        np.random.seed(args.global_seed)
+        torch.manual_seed(args.global_seed)
+        torch.cuda.manual_seed_all(args.global_seed)
+
+    return args
+
+class ESNcclLLM(LLM):
+    def __init__(self, *args, **kwargs):
+        # Preserve Ray-assigned CUDA_VISIBLE_DEVICES for correct GPU isolation
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        super().__init__(*args, **kwargs)
+
+def launch_engines(num_engines, model_name):
+    # Strict 1-GPU isolation via PGs (exactly like countdown)
+    # pgs = [placement_group([{"GPU": 1, "CPU": 8}], strategy="STRICT_PACK", lifetime="detached") for _ in range(num_engines)]
+    # ray.get([pg.ready() for pg in pgs])
+
+    # strategies = [
+    #     PlacementGroupSchedulingStrategy(
+    #         placement_group=pg,
+    #         placement_group_capture_child_tasks=True,
+    #         placement_group_bundle_index=0,
+    #     )
+    #     for pg in pgs
+    # ]
+
+    engines = [
+        ray.remote(num_cpus=8, num_gpus=1)(ESNcclLLM).remote(
+            model=model_name,
+            tensor_parallel_size=1,
+            distributed_executor_backend="mp",
+            worker_extension_cls="utils.worker_extn.WorkerExtension",
+            dtype="float16",
+            enable_prefix_caching=False,
+            enforce_eager=False,
+        )
+        for _ in range(num_engines)
+    ]
+    return engines, []
+
+def call_scorer_api(scorer_url, texts, batch_size=16):
+    """Call the external scorer API to get rewards and costs.
+    
+    texts are pre-formatted full conversation strings:
+      "BEGINNING OF CONVERSATION: USER: {user} ASSISTANT:{response}"
+    
+    We pass them directly to the scorer without splitting/rebuilding.
+    This follows the safe-rlhf pattern of passing the full sequence.
+    """
+    try:
+        all_rewards, all_costs = [], []
+
+        for i in range(0, len(texts), batch_size):
+            payload = {
+                "texts": texts[i:i+batch_size],
+            }
+            r = requests.post(f"{scorer_url}/score_texts", json=payload, timeout=60)
+            r.raise_for_status()
+            result = r.json()
+            all_rewards.extend(result["rewards"])
+            all_costs.extend(result["costs"])
+
+        return {
+            "per_sample_reward": all_rewards,
+            "per_sample_cost": all_costs,
+            "mean_reward": float(np.mean(all_rewards)) if all_rewards else 0.0,
+            "mean_cost": float(np.mean(all_costs)) if all_costs else 0.0,
+            "safe_count": sum(1 for c in all_costs if c <= 0),
+            "num_samples": len(all_costs),
+            "safe_ratio": (sum(1 for c in all_costs if c <= 0) / len(all_costs)) if all_costs else 0.0,
+        }
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling scorer API: {e}")
+        return {
+            "per_sample_reward": [0.0] * len(texts),
+            "per_sample_cost": [0.0] * len(texts),
+            "mean_reward": 0.0,
+            "mean_cost": 0.0,
+            "safe_count": 0,
+            "num_samples": len(texts),
+            "safe_ratio": 0.0,
+        }
+
+def evaluate_alignment_handle(llm, prompts, max_tokens):
+    sampling_params = SamplingParams(
+        temperature=0.0,  # greedy
+        seed=42,
+        max_tokens=max_tokens,
+    )
+    handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
+    return handle, time.time()
+
+def build_full_texts(prompts, outputs):
+    full_texts = []
+    for p, out in zip(prompts, outputs):
+        response = out.outputs[0].text
+        full_texts.append(p + response)
+    return full_texts
+
+def run_final_evaluation(llm, eval_prompts, scorer_url, args, lambda_for_eval=None):
+    print(f"\nRunning final evaluation on {len(eval_prompts)} samples...")
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        seed=42,
+        max_tokens=args.max_new_tokens,
+    )
+    outputs = ray.get(llm.generate.remote(eval_prompts, sampling_params, use_tqdm=True))
+
+    full_texts = build_full_texts(eval_prompts, outputs)
+    eval_scores = call_scorer_api(scorer_url, full_texts, batch_size=args.scorer_batch_size)
+
+    rewards = np.asarray(eval_scores["per_sample_reward"], dtype=np.float32)
+    costs = np.asarray(eval_scores["per_sample_cost"], dtype=np.float32)
+
+
+    lam = float(args.lambda_cost if lambda_for_eval is None else lambda_for_eval)
+
+    if args.safe_first:
+        r_eff = np.where(costs > 0.0, args.safe_first_factor * rewards, rewards)
+    else:
+        r_eff = rewards
+
+    # optional SCALE only
+    if args.standardize_within_batch:
+        r_std = float(r_eff.std()) + 1e-8
+        c_std = float(costs.std()) + 1e-8
+        r_eff = r_eff / r_std
+        costs  = costs / c_std
+
+    combined = r_eff - lam * costs
+
+    per_sample_results = []
+    for r, c, comb in zip(rewards.tolist(), costs.tolist(), combined.tolist()):
+        per_sample_results.append({
+            "reward": float(r),
+            "cost": float(c),
+            "combined": float(comb),
+        })
+
+    return {
+        "mean_reward": float(rewards.mean()) if rewards.size > 0 else 0.0,
+        "mean_cost": float(costs.mean()) if costs.size > 0 else 0.0,
+        "mean_combined": float(combined.mean()) if combined.size > 0 else 0.0,
+        "total_samples": len(full_texts),
+        "per_sample_results": per_sample_results,
+        "eval_prompts": eval_prompts,          # <--- add
+        "eval_outputs": outputs,               # vLLM RequestOutput list
+        "scores_raw": eval_scores,             # dict with per-sample arrays
+    }
+
+def log_artifact_dir(path, name, type_="model"):
+    if args.wandb_project and wandb is not None and os.path.exists(path):
+        art = wandb.Artifact(name=name, type=type_)
+        art.add_dir(path)
+        wandb.log_artifact(art)
+
+def log_artifact_file(path, name, type_="evaluation"):
+    if args.wandb_project and wandb is not None and os.path.exists(path):
+        art = wandb.Artifact(name=name, type=type_)
+        art.add_file(path)
+        wandb.log_artifact(art)
+
+
+class ESReplayLog:
+    """
+    Manages saving of compact replay logs for ES training.
+    
+    Instead of saving full model weights at every checkpoint, we save:
+    - One-time metadata (base model path, hyperparameters)
+    - Per-iteration: seeds and update coefficients (w_n = alpha/N * Z_n)
+    
+    This allows reconstructing any checkpoint by replaying the updates
+    from the base model, with ~39,000x storage reduction.
+    """
+    
+    def __init__(self, log_dir: str, base_model_path: str, args):
+        self.log_dir = log_dir
+        self.replay_dir = os.path.join(log_dir, "replay_logs")
+        os.makedirs(self.replay_dir, exist_ok=True)
+        
+        # Save one-time metadata
+        self.metadata = {
+            "base_model_path": base_model_path,
+            "sigma": args.sigma,
+            "alpha": args.alpha,
+            "population_size": args.population_size,
+            "num_iterations": args.num_iterations,
+            "global_seed": args.global_seed,
+            "lambda_cost_init": args.lambda_cost,
+            "lambda_adapt": args.lambda_adapt,
+            "created_at": datetime.now().strftime('%Y%m%d_%H%M%S'),
+        }
+        self._save_metadata()
+        
+        # In-memory buffer for current session
+        self.iteration_logs = []
+    
+    def _save_metadata(self):
+        """Save one-time run metadata."""
+        meta_path = os.path.join(self.replay_dir, "metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump(self.metadata, f, indent=2)
+    
+    def log_iteration(self, iteration: int, seeds: list, update_coeffs: list, 
+                      extra_state: dict = None):
+        """
+        Log a single iteration's update information.
+        
+        Args:
+            iteration: Current iteration number
+            seeds: List of seeds used for perturbations [s_1, ..., s_N]
+            update_coeffs: List of update coefficients [w_1, ..., w_N]
+                          where w_n = (alpha / N) * Z_n
+            extra_state: Optional dict with additional training state
+                        (current_lambda, jc_ema, etc.)
+        """
+        entry = {
+            "iteration": iteration,
+            "seeds": seeds,
+            "update_coeffs": update_coeffs,  # These are the w_n values
+        }
+        if extra_state:
+            entry["extra_state"] = extra_state
+        
+        self.iteration_logs.append(entry)
+        
+        # Append to JSONL file (one line per iteration for streaming)
+        log_path = os.path.join(self.replay_dir, "iteration_logs.jsonl")
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    
+    def save_full_checkpoint_marker(self, iteration: int, checkpoint_path: str):
+        """
+        Record that a full checkpoint was saved at this iteration.
+        This helps with efficient reconstruction (start from nearest full checkpoint).
+        """
+        markers_path = os.path.join(self.replay_dir, "full_checkpoints.json")
+        markers = []
+        if os.path.exists(markers_path):
+            with open(markers_path, "r") as f:
+                markers = json.load(f)
+        
+        markers.append({
+            "iteration": iteration,
+            "checkpoint_path": checkpoint_path,
+            "timestamp": datetime.now().strftime('%Y%m%d_%H%M%S'),
+        })
+        
+        with open(markers_path, "w") as f:
+            json.dump(markers, f, indent=2)
+    
+    def get_storage_stats(self):
+        """Return storage statistics for the replay log."""
+        log_path = os.path.join(self.replay_dir, "iteration_logs.jsonl")
+        if os.path.exists(log_path):
+            size_bytes = os.path.getsize(log_path)
+            return {
+                "log_size_bytes": size_bytes,
+                "log_size_kb": size_bytes / 1024,
+                "log_size_mb": size_bytes / (1024 * 1024),
+                "num_iterations": len(self.iteration_logs),
+            }
+        return {"log_size_bytes": 0, "num_iterations": 0}
+
+
+def find_latest_checkpoint(checkpoint_dir: str):
+    """
+    Find the latest checkpoint in a run directory.
+    Returns (weights_path, metadata) or (None, None) if no checkpoint found.
+    """
+    model_saves_dir = os.path.join(checkpoint_dir, "model_saves")
+    if not os.path.isdir(model_saves_dir):
+        return None, None
+    
+    # Look for tmp_iter_*.pth files and find the latest
+    checkpoints = []
+    for name in os.listdir(model_saves_dir):
+        if name.startswith("tmp_iter_") and name.endswith(".pth"):
+            try:
+                iteration = int(name.replace("tmp_iter_", "").replace(".pth", ""))
+                checkpoints.append((iteration, os.path.join(model_saves_dir, name)))
+            except ValueError:
+                continue
+    
+    if not checkpoints:
+        # Also check for latest_hf directory with ckpt_meta.json
+        latest_hf = os.path.join(model_saves_dir, "latest_hf")
+        if os.path.isdir(latest_hf):
+            meta_path = os.path.join(latest_hf, "ckpt_meta.json")
+            if os.path.exists(meta_path):
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                # latest_hf is an HF model dir, not a .pth file
+                return latest_hf, meta
+        return None, None
+    
+    # Sort by iteration and get the latest
+    checkpoints.sort(key=lambda x: x[0], reverse=True)
+    latest_iter, latest_path = checkpoints[0]
+    
+    # Look for corresponding metadata file
+    meta_path = latest_path.replace(".pth", "_meta.json")
+    metadata = None
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            metadata = json.load(f)
+    else:
+        # Fallback: create minimal metadata from filename
+        metadata = {"iteration": latest_iter}
+    
+    return latest_path, metadata
+
+
+def find_wandb_run_id(checkpoint_dir: str):
+    """Try to find the W&B run ID from a previous run."""
+    wandb_dir = os.path.join(checkpoint_dir, "wandb")
+    if not os.path.isdir(wandb_dir):
+        return None
+    
+    # Look for run-* directories (format: run-YYYYMMDD_HHMMSS-RUNID)
+    run_dirs = []
+    for name in os.listdir(wandb_dir):
+        if name.startswith("run-"):
+            run_dirs.append(name)
+    
+    if not run_dirs:
+        return None
+    
+    # Sort to get the latest run
+    run_dirs.sort(reverse=True)
+    latest_run = run_dirs[0]
+    
+    # Extract run ID (last part after the last dash)
+    parts = latest_run.split("-")
+    if len(parts) >= 3:
+        run_id = parts[-1]
+        # W&B run IDs are typically 8 chars
+        if run_id and len(run_id) >= 6:
+            return run_id
+    
+    return None
+
+
+def main(args):
+    # Ensure local Ray
+    os.environ.pop("RAY_ADDRESS", None)
+    os.environ.pop("RAY_HEAD_IP", None)
+    os.environ.pop("RAY_GCS_SERVER_ADDRESS", None)
+    ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
+
+    # Verify GPU availability (driver-level view)
+    resources = ray.cluster_resources()
+    gpu_count = resources.get('GPU', 0)
+    required_gpus = args.num_engines  # Only engines need GPUs (scorer is external)
+
+    print("=" * 80)
+    print(f"Ray Cluster Resources:")
+    print(f"  GPUs: {gpu_count}")
+    print(f"  CPUs: {resources.get('CPU', 0)}")
+    print(f"  Memory: {resources.get('memory', 0) / (1024**3):.2f} GB")
+    print(f"  Required: {required_gpus} GPUs for {args.num_engines} engines")
+    print(f"  Scorer API: {args.scorer_url}")
+    if gpu_count < required_gpus:
+        print(f"\n❌ ERROR: Need {required_gpus} GPUs but only {gpu_count} available!")
+        print(f"   Adjust --num_engines or ensure sufficient GPUs are allocated.")
+        ray.shutdown()
+        sys.exit(1)
+    print(f"✅ Found {gpu_count} GPUs - sufficient for training")
+    print("=" * 80)
+
+    # Check scorer API availability
+    try:
+        response = requests.get(f"{args.scorer_url}/health", timeout=5)
+        response.raise_for_status()
+        print(f"✅ Scorer API is available at {args.scorer_url}")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ ERROR: Scorer API at {args.scorer_url} is not responding: {e}")
+        print("Make sure the scorer service is running before continuing.")
+        ray.shutdown()
+        sys.exit(1)
+
+    # Check for resumption
+    resume_checkpoint = None
+    resume_metadata = None
+    resume_wandb_run_id = None
+    start_iteration = 0
+    
+    if args.resume_from:
+        # args.resume_from can be a full path or just a directory name
+        if os.path.isabs(args.resume_from):
+            resume_dir = args.resume_from
+        else:
+            resume_dir = os.path.join(args.experiment_dir, args.resume_from)
+        
+        if os.path.isdir(resume_dir):
+            resume_checkpoint, resume_metadata = find_latest_checkpoint(resume_dir)
+            if resume_checkpoint:
+                print(f"✅ Found checkpoint to resume from: {resume_checkpoint}")
+                if resume_metadata:
+                    start_iteration = resume_metadata.get("iteration", 0)
+                    print(f"   Resuming from iteration: {start_iteration}")
+                    if resume_metadata.get("current_lambda") is not None:
+                        print(f"   Restoring lambda: {resume_metadata['current_lambda']}")
+                    if resume_metadata.get("jc_ema") is not None:
+                        print(f"   Restoring jc_ema: {resume_metadata['jc_ema']}")
+                
+                # Try to find W&B run ID for resumption
+                resume_wandb_run_id = resume_metadata.get("wandb_run_id") if resume_metadata else None
+                if not resume_wandb_run_id:
+                    resume_wandb_run_id = find_wandb_run_id(resume_dir)
+                if resume_wandb_run_id:
+                    print(f"   Found W&B run ID to resume: {resume_wandb_run_id}")
+            else:
+                print(f"⚠️  No checkpoint found in {resume_dir}, starting fresh")
+        else:
+            print(f"⚠️  Resume directory not found: {resume_dir}, starting fresh")
+
+    # Logging - use resume directory if resuming, otherwise create new
+    if args.resume_from and resume_checkpoint and os.path.isdir(resume_dir):
+        logging_dir = resume_dir
+        print(f"📁 Resuming in existing directory: {logging_dir}")
+    else:
+        # Use higher-resolution timestamp and optional SLURM job id to avoid collisions
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        job_id = os.environ.get("SLURM_JOB_ID")
+        suffix = f"{ts}_{job_id}" if job_id else ts
+        logging_dir = f"{args.experiment_dir}/alignment_nccl_{suffix}"
+    
+    writer = SummaryWriter(log_dir=logging_dir)
+    
+    if args.wandb_project and wandb is not None:
+        default_name = args.wandb_run_name or f"accl_api_{os.path.basename(args.policy_model_path)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        if resume_wandb_run_id:
+            # Resume existing W&B run
+            print(f"📊 Resuming W&B run: {resume_wandb_run_id}")
+            wandb.init(
+                project=args.wandb_project, 
+                id=resume_wandb_run_id,
+                resume="must",
+                config={
+                    'policy_model_path': args.policy_model_path,
+                    'scorer_url': args.scorer_url,
+                    'sigma': args.sigma,
+                    'alpha': args.alpha,
+                    'population_size': args.population_size,
+                    'num_engines': args.num_engines,
+                    'lambda_cost_init': args.lambda_cost,
+                    'lambda_adapt': args.lambda_adapt,
+                    'safe_first': args.safe_first,
+                    'standardize_within_batch': args.standardize_within_batch,
+                    'batch_size': args.batch_size,
+                    'scorer_batch_size': args.scorer_batch_size,
+                    'eval_every': args.eval_every,
+                    'train_jsonl': args.train_jsonl,
+                    'eval_jsonl': args.eval_jsonl,
+                    'train_samples': args.train_samples,
+                    'eval_samples': args.eval_samples,
+                    'resumed_from_iteration': start_iteration,
+                })
+        else:
+            # Start new W&B run
+            wandb.init(project=args.wandb_project, name=default_name, config={
+                'policy_model_path': args.policy_model_path,
+                'scorer_url': args.scorer_url,
+                'sigma': args.sigma,
+                'alpha': args.alpha,
+                'population_size': args.population_size,
+                'num_engines': args.num_engines,
+                'lambda_cost_init': args.lambda_cost,
+                'lambda_adapt': args.lambda_adapt,
+                'safe_first': args.safe_first,
+                'standardize_within_batch': args.standardize_within_batch,
+                'batch_size': args.batch_size,
+                'scorer_batch_size': args.scorer_batch_size,
+                'eval_every': args.eval_every,
+                'train_jsonl': args.train_jsonl,
+                'eval_jsonl': args.eval_jsonl,
+                'train_samples': args.train_samples,
+                'eval_samples': args.eval_samples,
+            })
+        wandb.define_metric("iteration")
+        wandb.define_metric("*", step_metric="iteration")
+
+    # Prepare an HF checkpoint for vLLM to load
+    model_saves_dir = f"{logging_dir}/model_saves"
+    os.makedirs(model_saves_dir, exist_ok=True)
+
+    # Resolve base model path: use provided local path if directory exists; otherwise, fetch and save
+    if os.path.isdir(args.policy_model_path):
+        base_model_path = args.policy_model_path
+    else:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.policy_model_path, torch_dtype=torch.float16
+        ).to("cpu")
+        tokenizer = AutoTokenizer.from_pretrained(args.policy_model_path)
+        base_model_path = f"{model_saves_dir}/base_model"
+        if os.path.exists(base_model_path):
+            shutil.rmtree(base_model_path)
+        os.makedirs(base_model_path, exist_ok=True)
+        tokenizer.save_pretrained(base_model_path)
+        base_model.save_pretrained(base_model_path)
+        del base_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Load policy tokenizer for prompt formatting
+    policy_tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+
+    # Initialize replay log if enabled
+    replay_log = None
+    if args.save_replay_log:
+        replay_log = ESReplayLog(logging_dir, base_model_path, args)
+        print(f"📝 Replay log enabled - saving seeds + coefficients to {replay_log.replay_dir}")
+
+    def save_hf_latest_from_engine(engine, iteration: int, current_lambda_val: float = None, 
+                                     jc_ema_val: float = None, wandb_run_id: str = None):
+        """Save current engine weights into HF-format 'latest' directory with training state."""
+        tmp_path = f"{model_saves_dir}/tmp_iter_{iteration}.pth"
+        # dump raw state_dict from engine to tmp
+        ray.get(engine.collective_rpc.remote("save_self_weights_to_disk", args=(tmp_path,)))
+        
+        # Save training state metadata alongside the .pth file
+        meta_path = f"{model_saves_dir}/tmp_iter_{iteration}_meta.json"
+        training_state = {
+            "iteration": iteration,
+            "timestamp": datetime.now().strftime('%Y%m%d_%H%M%S'),
+            "current_lambda": current_lambda_val,
+            "jc_ema": jc_ema_val,
+            "wandb_run_id": wandb_run_id,
+        }
+        with open(meta_path, "w") as f:
+            json.dump(training_state, f, indent=2)
+        
+        # load base model on CPU and load state dict
+        mdl = AutoModelForCausalLM.from_pretrained(base_model_path, torch_dtype=torch.float16).to("cpu")
+        state = torch.load(tmp_path, map_location="cpu")
+        mdl.load_state_dict(state, strict=True)
+        # write to latest_hf
+        latest_dir = f"{model_saves_dir}/latest_hf"
+        if os.path.exists(latest_dir):
+            shutil.rmtree(latest_dir)
+        os.makedirs(latest_dir, exist_ok=True)
+        policy_tokenizer.save_pretrained(latest_dir)
+        mdl.save_pretrained(latest_dir)
+        with open(os.path.join(latest_dir, "ckpt_meta.json"), "w") as f:
+            json.dump(training_state, f, indent=2)
+        # Keep the .pth and metadata for resumption (don't delete)
+        del mdl, state
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Load prompts from custom JSONL - errors out if path is provided but loading fails
+    def load_prompts_from_jsonl(path: str, n: int):
+        prompts_raw = []
+        with open(path, 'r') as f:
+            for line in f:
+                obj = json.loads(line)
+                if 'prompt' in obj:
+                    prompts_raw.append(obj['prompt'])
+        if not prompts_raw:
+            raise ValueError(f"No prompts found in JSONL file: {path} (no 'prompt' key in any row)")
+        rng = random.Random(args.global_seed or 42)
+        if n < len(prompts_raw):
+            prompts_raw = rng.sample(prompts_raw, n)
+        prompts = []
+        for user_prompt in prompts_raw:
+            conv = format_prompt_local(user_prompt, policy_tokenizer.eos_token or '</s>')
+            if not conv.endswith(PROMPT_ASSISTANT):
+                conv = conv + PROMPT_ASSISTANT
+            prompts.append(conv)
+        print(f"Loaded {len(prompts)} prompts from {path}")
+        print(f"First 5 prompts: {prompts[:5]}")
+        return prompts
+
+    def sample_prompts(split: str, n: int, jsonl_path: str | None = None):
+        # If JSONL path is provided, it MUST load successfully - no silent fallback
+        if jsonl_path:
+            if not os.path.exists(jsonl_path):
+                raise FileNotFoundError(f"JSONL file not found: {jsonl_path}")
+            return load_prompts_from_jsonl(jsonl_path, n)
+        
+        # No JSONL provided - use PKU dataset
+        print(f"Loading {split} dataset from PKU-Alignment/PKU-SafeRLHF")
+        ds = load_dataset('PKU-Alignment/PKU-SafeRLHF', split=split)
+        total = len(ds)
+        indices = list(range(total))
+        if n < total:
+            rng = random.Random(args.global_seed or 42)
+            indices = rng.sample(indices, n)
+        prompts = []
+        for idx in indices[:n]:
+            raw = ds[int(idx)]
+            user_prompt = raw['prompt']
+            conv = format_prompt_local(user_prompt, policy_tokenizer.eos_token or '</s>')
+            if not conv.endswith(PROMPT_ASSISTANT):
+                conv = conv + PROMPT_ASSISTANT
+            prompts.append(conv)
+        return prompts
+
+    train_prompts = sample_prompts('train', args.train_samples, args.train_jsonl)
+    eval_prompts = sample_prompts('test', args.eval_samples, args.eval_jsonl)
+
+    # Print data info
+    print("\n" + "=" * 60)
+    print("📊 DATA CONFIGURATION")
+    print("=" * 60)
+    print(f"  Train data: {args.train_jsonl if args.train_jsonl and os.path.exists(args.train_jsonl) else 'PKU-Alignment/PKU-SafeRLHF (train split)'}")
+    print(f"  Train samples loaded: {len(train_prompts)}")
+    print(f"  Eval data:  {args.eval_jsonl if args.eval_jsonl and os.path.exists(args.eval_jsonl) else 'PKU-Alignment/PKU-SafeRLHF (test split)'}")
+    print(f"  Eval samples loaded:  {len(eval_prompts)}")
+    print("=" * 60 + "\n")
+
+    # Determine model path for engine launch (use checkpoint if resuming)
+    if resume_checkpoint:
+        # Check if it's an HF directory or a .pth file
+        if os.path.isdir(resume_checkpoint):
+            engine_model_path = resume_checkpoint
+            print(f"📦 Loading engines from HF checkpoint: {engine_model_path}")
+        else:
+            # It's a .pth file - we need to convert it to HF format first
+            print(f"📦 Loading weights from checkpoint: {resume_checkpoint}")
+            # Load the .pth into HF format for vLLM
+            resume_hf_dir = f"{model_saves_dir}/resume_hf_tmp"
+            if os.path.exists(resume_hf_dir):
+                shutil.rmtree(resume_hf_dir)
+            os.makedirs(resume_hf_dir, exist_ok=True)
+            
+            mdl = AutoModelForCausalLM.from_pretrained(base_model_path, torch_dtype=torch.float16).to("cpu")
+            state = torch.load(resume_checkpoint, map_location="cpu")
+            mdl.load_state_dict(state, strict=True)
+            policy_tokenizer.save_pretrained(resume_hf_dir)
+            mdl.save_pretrained(resume_hf_dir)
+            del mdl, state
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            engine_model_path = resume_hf_dir
+            print(f"   Converted checkpoint to HF format at: {engine_model_path}")
+    else:
+        engine_model_path = base_model_path
+
+    # Launch engines (exactly like countdown)
+    print(f"\nLaunching {args.num_engines} vLLM engines with placement groups...")
+    engines, _ = launch_engines(args.num_engines, engine_model_path)
+    print(f"✅ Submitted {len(engines)} engines")
+
+    # Initialize lambda for Lagrangian adaptation (restore from checkpoint if available)
+    if resume_metadata and resume_metadata.get("current_lambda") is not None:
+        current_lambda = float(resume_metadata["current_lambda"])
+        print(f"   Restored current_lambda = {current_lambda}")
+    else:
+        current_lambda = float(args.lambda_cost)
+    
+    if resume_metadata and resume_metadata.get("jc_ema") is not None:
+        jc_ema = float(resume_metadata["jc_ema"])
+        print(f"   Restored jc_ema = {jc_ema}")
+    else:
+        jc_ema = None
+    
+    # Get W&B run ID for saving in checkpoints
+    current_wandb_run_id = wandb.run.id if (args.wandb_project and wandb is not None and wandb.run) else None
+
+    # Init inter-engine communicator once
+    master_address = get_ip()
+    master_port = get_open_port()
+    ray.get([
+        engines[i].collective_rpc.remote(
+            "init_inter_engine_group", args=(master_address, master_port, i, args.num_engines)
+        )
+        for i in range(args.num_engines)
+    ])
+
+    def cleanup():
+        for llm in engines:
+            try:
+                ray.kill(llm)
+            except Exception:
+                pass
+        # for pg in pgs:
+        #     try:
+        #         remove_placement_group(pg)
+        #     except Exception:
+        #         pass
+        ray.shutdown()
+
+    def sig_handler(sig, frame):
+        cleanup()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+
+    # Training loop (exactly like original but with API calls)
+    # Resume from start_iteration if resuming from checkpoint
+    if start_iteration > 0:
+        print(f"\n🔄 Resuming training from iteration {start_iteration}")
+    
+    for i in range(start_iteration, args.num_iterations):
+        print(f"\n\n=== Generation {i} ===")
+        total_iter_start = time.time()
+
+        # Random seeds for population
+        seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
+        seeds_perf = {}
+
+        # Round-robin scheduling
+        seed_iter = iter(seeds)
+        inflight = {}
+        results_this_gen = []
+        # For logging distributions
+        all_rewards_samples = []
+        all_cost_samples = []
+        total_safe_count = 0
+        total_sampled = 0
+
+        # Choose a deterministic subset of prompts for this generation
+        bs = min(args.batch_size, len(train_prompts))
+        rng = random.Random((args.global_seed or 42) * 100000 + i)
+        subset_indices = rng.sample(range(len(train_prompts)), bs) if bs < len(train_prompts) else list(range(len(train_prompts)))
+        curr_prompts = [train_prompts[idx] for idx in subset_indices]
+
+        # Kick off an eval on each engine
+        for eng_idx, llm in enumerate(engines):
+            try:
+                seed = next(seed_iter)
+            except StopIteration:
+                break
+            # Add exploration noise
+            ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
+            handle, start_ts = evaluate_alignment_handle(llm, curr_prompts, args.max_new_tokens)
+            inflight[handle] = {
+                "engine": llm,
+                "engine_idx": eng_idx,
+                "seed": seed,
+                "start_ts": start_ts,
+            }
+
+        while inflight:
+            done, _ = ray.wait(list(inflight.keys()), num_returns=1)
+            h = done[0]
+            meta = inflight.pop(h)
+
+            outputs = ray.get(h)
+            full_texts = build_full_texts(curr_prompts, outputs)
+            
+            # Call scorer API instead of Ray actor
+            metrics = call_scorer_api(args.scorer_url, full_texts, batch_size=args.scorer_batch_size)
+            elapsed = time.time() - meta["start_ts"]
+
+            # Combine with optional safe-first and within-batch standardization
+            rewards_np = np.asarray(metrics["per_sample_reward"], dtype=np.float32)
+            costs_np = np.asarray(metrics["per_sample_cost"], dtype=np.float32)
+            all_rewards_samples.extend(rewards_np.tolist())
+            all_cost_samples.extend(costs_np.tolist())
+            total_safe_count += int(np.sum(costs_np <= 0.0))
+            total_sampled += int(costs_np.size)
+
+            if args.safe_first:
+                r_eff = np.where(costs_np > 0.0, args.safe_first_factor * rewards_np, rewards_np)
+            else:
+                r_eff = rewards_np
+
+            # means over the batch
+            r_mean = float(r_eff.mean())
+            c_mean = float(costs_np.mean())
+
+            # optional SCALE (divide by std), but DO NOT center
+            if args.standardize_within_batch:
+                r_std = float(r_eff.std()) + 1e-8
+                c_std = float(costs_np.std()) + 1e-8
+                r_mean /= r_std
+                c_mean /= c_std
+
+            mean_combined = r_mean - current_lambda * c_mean
+
+            seeds_perf[meta["seed"]] = {
+                **metrics,
+                "mean_combined": mean_combined,
+            }
+            results_this_gen.append({"seed": meta["seed"], "avg_combined": mean_combined, "time": elapsed})
+
+            llm = meta["engine"]
+            # Remove exploration noise
+            ray.get(llm.collective_rpc.remote("restore_self_weights", args=(meta["seed"], args.sigma)))
+
+            # Schedule next seed on this engine
+            try:
+                next_seed = next(seed_iter)
+            except StopIteration:
+                continue
+
+            ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(next_seed, args.sigma, False)))
+            handle, start_ts = evaluate_alignment_handle(llm, curr_prompts, args.max_new_tokens)
+            inflight[handle] = {
+                "engine": llm,
+                "engine_idx": meta["engine_idx"],
+                "seed": next_seed,
+                "start_ts": start_ts,
+            }
+            if args.verbose:
+                print(f"Scheduled seed {next_seed} on engine {meta['engine_idx']}")
+
+        # Optional Lagrangian lambda adaptation using baseline (unperturbed) policy
+        if args.lambda_adapt:
+            base_handle, _ = evaluate_alignment_handle(engines[0], curr_prompts, args.max_new_tokens)
+            base_outputs = ray.get(base_handle)
+            base_texts = build_full_texts(curr_prompts, base_outputs)
+            base_scores = call_scorer_api(args.scorer_url, base_texts, batch_size=args.scorer_batch_size)
+            base_costs = np.asarray(base_scores["per_sample_cost"], dtype=np.float32)
+
+            # Paper: J_C(θ) = E[C] + d; update on the positive part and use a moving average
+            jc_raw = float(np.mean(base_costs) + args.cost_threshold_d)
+            jc = max(jc_raw, 0.0) if args.lambda_pos_cost_only else jc_raw
+            jc_ema = jc if jc_ema is None else (args.jc_ema_beta * jc_ema + (1.0 - args.jc_ema_beta) * jc)
+
+            ln_lambda = float(np.log(max(current_lambda, 1e-12)))
+            ln_lambda += args.lambda_lr * jc_ema
+            current_lambda = float(np.clip(np.exp(ln_lambda), args.lambda_min, args.lambda_max))
+            writer.add_scalar("lambda/J_C", jc, i)
+            writer.add_scalar("lambda/J_C_raw", jc_raw, i)
+            writer.add_scalar("lambda/J_C_ema", jc_ema, i)
+            writer.add_scalar("lambda/value", current_lambda, i)
+            writer.add_scalar("lambda/d", args.cost_threshold_d, i)
+            if args.wandb_project and wandb is not None:
+                wandb.log({
+                    "iteration": i,
+                    "lambda/J_C": jc,
+                    "lambda/J_C_raw": jc_raw,
+                    "lambda/value": current_lambda
+                }, step=i)
+                wandb.log({"iteration": i, "lambda/d": args.cost_threshold_d}, step=i)
+        # Normalize combined objective
+        all_means = [v["mean_combined"] for v in seeds_perf.values()]
+        mean_combined = float(np.mean(all_means)) if all_means else 0.0
+        std_combined = float(np.std(all_means)) if all_means else 0.0
+        min_combined = float(np.min(all_means)) if all_means else 0.0
+        max_combined = float(np.max(all_means)) if all_means else 0.0
+
+        print(f"Mean combined: {mean_combined}, std: {std_combined}, min: {min_combined}, max: {max_combined}")
+        for k in seeds_perf:
+            seeds_perf[k]["norm_reward"] = (seeds_perf[k]["mean_combined"] - mean_combined) / (std_combined + 1e-8)
+            if args.verbose:
+                print(f"Seed {k} normalized reward: {seeds_perf[k]['norm_reward']}")
+
+        writer.add_scalar("combined/mean", mean_combined, i)
+        writer.add_scalar("combined/std", std_combined, i)
+        writer.add_scalar("combined/min", min_combined, i)
+        writer.add_scalar("combined/max", max_combined, i)
+        writer.add_scalar("helpfulness/mean", float(np.mean([v["mean_reward"] for v in seeds_perf.values()])), i)
+        writer.add_scalar("cost/mean", float(np.mean([v["mean_cost"] for v in seeds_perf.values()])), i)
+        if total_sampled > 0:
+            writer.add_scalar("safety/safe_ratio", float(total_safe_count) / float(total_sampled), i)
+        if i % 25 == 0:
+            try:
+                writer.add_histogram("helpfulness/dist", np.asarray(all_rewards_samples, dtype=np.float32), i)
+                writer.add_histogram("cost/dist", np.asarray(all_cost_samples, dtype=np.float32), i)
+            except Exception:
+                pass
+        if args.wandb_project and wandb is not None:
+            log_payload = {
+                'combined/mean': mean_combined,
+                'combined/std': std_combined,
+                'combined/min': min_combined,
+                'combined/max': max_combined,
+                'helpfulness/mean': float(np.mean([v["mean_reward"] for v in seeds_perf.values()])),
+                'cost/mean': float(np.mean([v["mean_cost"] for v in seeds_perf.values()])),
+            }
+            if total_sampled > 0:
+                log_payload['safety/safe_ratio'] = float(total_safe_count) / float(total_sampled)
+            # TODO: Replace this by a parameter
+            if (i + 1) % 50 == 0:
+                try:
+                    log_payload['helpfulness/dist'] = wandb.Histogram(np.asarray(all_rewards_samples, dtype=np.float32))
+                    log_payload['cost/dist'] = wandb.Histogram(np.asarray(all_cost_samples, dtype=np.float32))
+                    if args.wandb_project and wandb is not None and all_rewards_samples and all_cost_samples:
+                        sample = min(2000, len(all_rewards_samples))
+                        idx = np.random.choice(len(all_rewards_samples), sample, replace=False)
+                        table = wandb.Table(
+                            data=[[float(all_rewards_samples[j]), float(all_cost_samples[j])] for j in idx],
+                            columns=["reward", "cost"]
+                        )
+                        wandb.log({
+                            "iteration": i,
+                            "scatter/reward_vs_cost": wandb.plot.scatter(table, "reward", "cost",
+                                                                        title="Reward vs Cost (sampled)")
+                        }, step=i)
+                except Exception:
+                    pass
+            wandb.log(log_payload, step=i)
+
+        # ES update on engine 0 (exactly like countdown)
+        per_seed_coeffs = [
+            (seed, (args.alpha / args.population_size) * float(seeds_perf[seed]["norm_reward"]))
+            for seed in seeds
+        ]
+
+        perturb_start = time.time()
+        handles = []
+        for seed, coeff in per_seed_coeffs:
+            handles.append(engines[0].collective_rpc.remote("perturb_self_weights", args=(seed, coeff, False)))
+        ray.get(handles)
+        if args.verbose:
+            print(f"Applied perturbations in {time.time() - perturb_start}s")
+        writer.add_scalar("time/perturbation_application", time.time() - perturb_start, i)
+
+        # Log iteration to replay log if enabled
+        if replay_log is not None:
+            update_coeffs = [coeff for _, coeff in per_seed_coeffs]
+            extra_state = {
+                "current_lambda": current_lambda,
+                "jc_ema": jc_ema,
+            }
+            replay_log.log_iteration(i, seeds, update_coeffs, extra_state)
+            if args.verbose:
+                stats = replay_log.get_storage_stats()
+                print(f"Replay log: {stats['num_iterations']} iters, {stats['log_size_kb']:.2f} KB")
+
+        # Broadcast updated weights from engine 0 to all engines (avoid CPU copies)
+        broadcast_start = time.time()
+        ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
+        if args.verbose:
+            print(f"Broadcasted updated weights in {time.time() - broadcast_start}s")
+        writer.add_scalar("time/broadcast", time.time() - broadcast_start, i)
+
+        total_iter_end = time.time()
+        writer.add_scalar("time/iteration", total_iter_end - total_iter_start, i)
+        print(f"wall clock time for iteration {i}: {total_iter_end - total_iter_start}s")
+        print(f"=== Generation {i} finished ===\n")
+
+        # Periodic evaluation during training
+        if args.eval_every > 0 and ((i + 1) % args.eval_every == 0):
+            eval_results_i = run_final_evaluation(engines[0], eval_prompts, args.scorer_url, args, current_lambda)
+            writer.add_scalar("eval/mean_reward", eval_results_i["mean_reward"], i)
+            writer.add_scalar("eval/mean_cost", eval_results_i["mean_cost"], i)
+            writer.add_scalar("eval/mean_combined", eval_results_i["mean_combined"], i)
+            if args.wandb_project and wandb is not None:
+                # Log eval samples table with full prompts and completions (no trimming)
+                rows = []
+                n_samples = len(eval_results_i["eval_prompts"])
+                for k in range(n_samples):
+                    prompt = eval_results_i["eval_prompts"][k]
+                    resp = eval_results_i["eval_outputs"][k].outputs[0].text
+                    r = float(eval_results_i["scores_raw"]["per_sample_reward"][k])
+                    c = float(eval_results_i["scores_raw"]["per_sample_cost"][k])
+                    comb = r - current_lambda * c
+                    rows.append([prompt, resp, r, c, comb, bool(c > 0.0)])
+                table = wandb.Table(
+                    columns=["prompt", "response", "reward", "cost", "combined", "unsafe"],
+                    data=rows
+                )
+                wandb.log({
+                    "iteration": i,
+                    "eval/samples": table,
+                    'eval/mean_reward': eval_results_i['mean_reward'],
+                    'eval/mean_cost': eval_results_i['mean_cost'],
+                    'eval/mean_combined': eval_results_i['mean_combined'],
+                    'eval/total_samples': eval_results_i['total_samples'],
+                }, step=i)
+
+        # Periodic checkpoint saving
+        # Use full_checkpoint_every if set (for hybrid replay log + checkpoints), otherwise save_every
+        full_ckpt_interval = args.full_checkpoint_every if args.full_checkpoint_every > 0 else args.save_every
+        if full_ckpt_interval > 0 and ((i + 1) % full_ckpt_interval == 0):
+            try:
+                # First, save the raw .pth file (vLLM format) - this always works
+                tmp_path = f"{model_saves_dir}/tmp_iter_{i + 1}.pth"
+                ray.get(engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(tmp_path,)))
+                
+                # Save metadata alongside the .pth file
+                meta_path = f"{model_saves_dir}/tmp_iter_{i + 1}_meta.json"
+                training_state = {
+                    "iteration": i + 1,
+                    "timestamp": datetime.now().strftime('%Y%m%d_%H%M%S'),
+                    "current_lambda": current_lambda,
+                    "jc_ema": jc_ema,
+                    "wandb_run_id": current_wandb_run_id,
+                }
+                with open(meta_path, "w") as f:
+                    json.dump(training_state, f, indent=2)
+                
+                # Mark this checkpoint in replay log BEFORE attempting HF conversion
+                if replay_log is not None:
+                    replay_log.save_full_checkpoint_marker(i + 1, tmp_path)
+                    print(f"📌 Full checkpoint saved at iteration {i + 1} (marked in replay log)")
+                
+                # Try HF conversion (may fail due to vLLM fused weights, but .pth is saved)
+                try:
+                    save_hf_latest_from_engine(
+                        engines[0], 
+                        i + 1, 
+                        current_lambda_val=current_lambda,
+                        jc_ema_val=jc_ema,
+                        wandb_run_id=current_wandb_run_id,
+                    )
+                except Exception as hf_err:
+                    print(f"Note: HF format conversion skipped at iter {i+1} (vLLM weights saved as .pth)")
+                
+                if args.wandb_project and wandb is not None:
+                    wandb.log({'checkpoint/iteration': i + 1}, step=i)
+            except Exception as e:
+                print(f"Warning: failed to save checkpoint at iter {i+1}: {e}")
+
+    # FINAL EVAL
+    print("\n" + "="*80)
+    print("FINAL EVALUATION")
+    print("="*80)
+
+    eval_results = run_final_evaluation(engines[0], eval_prompts, args.scorer_url, args, current_lambda)
+
+    print(f"\nMean Reward: {eval_results['mean_reward']:.4f}")
+    print(f"Mean Cost: {eval_results['mean_cost']:.4f}")
+    print(f"Mean Combined: {eval_results['mean_combined']:.4f}")
+    print("="*80 + "\n")
+    if args.wandb_project and wandb is not None:
+        # Log eval samples table with full prompts and completions (no trimming)
+        final_eval_rows = []
+        n_samples = len(eval_results["eval_prompts"])
+        for k in range(n_samples):
+            prompt = eval_results["eval_prompts"][k]
+            resp = eval_results["eval_outputs"][k].outputs[0].text
+            r = float(eval_results["scores_raw"]["per_sample_reward"][k])
+            c = float(eval_results["scores_raw"]["per_sample_cost"][k])
+            comb = r - current_lambda * c
+            final_eval_rows.append([prompt, resp, r, c, comb, bool(c > 0.0)])
+        final_eval_table = wandb.Table(
+            columns=["prompt", "response", "reward", "cost", "combined", "unsafe"],
+            data=final_eval_rows
+        )
+        wandb.log({
+            'eval/final_samples': final_eval_table,
+            'eval/mean_reward': eval_results['mean_reward'],
+            'eval/mean_cost': eval_results['mean_cost'],
+            'eval/mean_combined': eval_results['mean_combined'],
+            'eval/total_samples': eval_results['total_samples'],
+        })
+
+    # Save evaluation results to JSON
+    logs_dir = f"{logging_dir}/logs"
+    os.makedirs(logs_dir, exist_ok=True)
+
+    eval_output = {
+        "metadata": {
+            "policy_model_path": args.policy_model_path,
+            "num_iterations": args.num_iterations,
+            "timestamp": datetime.now().strftime('%Y%m%d_%H%M%S'),
+            "scorer_url": args.scorer_url,
+            "lambda_cost": args.lambda_cost,
+        },
+        "metrics": {
+            "mean_reward": eval_results["mean_reward"],
+            "mean_cost": eval_results["mean_cost"],
+            "mean_combined": eval_results["mean_combined"],
+            "total_samples": eval_results["total_samples"],
+        },
+        "per_sample_results": eval_results["per_sample_results"],
+    }
+
+    eval_json_path = f"{logs_dir}/final_eval_results.json"
+    with open(eval_json_path, "w") as f:
+        json.dump(eval_output, f, indent=2)
+    print(f"Evaluation results saved to {eval_json_path}\n")
+
+    # Save final HF-format checkpoint to 'latest_hf'
+    try:
+        save_hf_latest_from_engine(
+            engines[0], 
+            args.num_iterations,
+            current_lambda_val=current_lambda,
+            jc_ema_val=jc_ema,
+            wandb_run_id=current_wandb_run_id,
+        )
+        if args.wandb_project and wandb is not None and wandb.run:
+            log_artifact_dir(f"{model_saves_dir}/latest_hf", name=f"{wandb.run.id}-latest_hf", type_="model")
+
+        print("Final HF-format checkpoint saved to latest_hf.")
+    except Exception as e:
+        print(f"Warning: failed to save final HF-format checkpoint: {e}")
+
+    # Save final model weights (all engines are in sync; save from engine 0)
+    final_model_path = f"{model_saves_dir}/final_model_iteration_{args.num_iterations}"
+    os.makedirs(final_model_path, exist_ok=True)
+    ray.get(
+        engines[0].collective_rpc.remote(
+            "save_self_weights_to_disk", args=(f"{final_model_path}/pytorch_model.pth",)
+        )
+    )
+    if args.wandb_project and wandb is not None and wandb.run:
+        log_artifact_dir(final_model_path, name=f"{wandb.run.id}-final_model", type_="model")
+    print(f"Final model weights saved to {final_model_path}.")
+
+    # Print replay log storage stats if enabled
+    if replay_log is not None:
+        stats = replay_log.get_storage_stats()
+        print(f"\n📊 Replay Log Storage Stats:")
+        print(f"   Iterations logged: {stats['num_iterations']}")
+        print(f"   Log size: {stats['log_size_kb']:.2f} KB ({stats['log_size_mb']:.4f} MB)")
+        full_model_size_gb = 14  # Approximate size of Alpaca-7B in GB
+        estimated_savings = (full_model_size_gb * 1024) / max(stats['log_size_mb'], 0.001)
+        print(f"   Estimated storage savings: ~{estimated_savings:.0f}x vs full checkpoint")
+
+    cleanup()
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)
